@@ -113,7 +113,7 @@ uniform sampler2D u_lightmap;
 void main() {
     vec4 diffuse = texture(u_diffuse, vUV);
     float light = texture(u_lightmap, vLmUV).r;
-    FragColor = diffuse * vec4(vec3(light), 1.0);
+    FragColor = diffuse * vec4(vec3(light * 2.0), 1.0);
 }
 "#;
 
@@ -142,8 +142,9 @@ fn face_lightmap_info(bsp: &Bsp, face: &BspFace, ti: &BspTexinfo) -> (u32, u32, 
 
     let min_s_aligned = (min_s / 16.0).floor() * 16.0;
     let min_t_aligned = (min_t / 16.0).floor() * 16.0;
-    let lm_w = ((max_s / 16.0).floor() - (min_s / 16.0).floor() + 1.0) as u32;
-    let lm_h = ((max_t / 16.0).floor() - (min_t / 16.0).floor() + 1.0) as u32;
+    // Game uses ceil for max (not floor like Quake)
+    let lm_w = ((max_s / 16.0).ceil() - (min_s / 16.0).floor() + 1.0) as u32;
+    let lm_h = ((max_t / 16.0).ceil() - (min_t / 16.0).floor() + 1.0) as u32;
 
     // Clamp to reasonable sizes
     let lm_w = lm_w.max(1).min(256);
@@ -337,6 +338,14 @@ impl BspRenderer {
             } else {
                 face_lightmaps.push(None);
             }
+        }
+
+        // Debug: check lightmap data range
+        if !bsp.lightmap_data.is_empty() {
+            let lm_min = *bsp.lightmap_data.iter().min().unwrap();
+            let lm_max = *bsp.lightmap_data.iter().max().unwrap();
+            let lm_avg: f32 = bsp.lightmap_data.iter().map(|&b| b as f32).sum::<f32>() / bsp.lightmap_data.len() as f32;
+            println!("Lightmap data range: min={lm_min} max={lm_max} avg={lm_avg:.1}");
         }
 
         println!(

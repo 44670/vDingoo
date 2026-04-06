@@ -92,6 +92,14 @@ pub struct BspModel {
     pub num_faces: u32,
 }
 
+/// A camera spot from the BSP entity data (EPair lump).
+#[derive(Debug, Clone)]
+pub struct BspCameraSpot {
+    pub pos: [f32; 3],
+    pub dir: [f32; 3],
+    pub dist: f32,
+}
+
 pub struct Bsp {
     pub bbox_min: [f32; 3],
     pub bbox_max: [f32; 3],
@@ -102,11 +110,22 @@ pub struct Bsp {
     pub texinfos: Vec<BspTexinfo>,
     pub faces: Vec<BspFace>,
     pub lightmap_data: Vec<u8>,
+    pub camera_spots: Vec<BspCameraSpot>,
 }
 
 struct LumpDir {
     offset: usize,
     size: usize,
+}
+
+/// Parse "(x,y,z)" string from BSP EPair data.
+fn parse_vec3(s: &str) -> Option<[f32; 3]> {
+    let s = s.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let mut parts = s.split(',');
+    let x = parts.next()?.trim().parse::<f32>().ok()?;
+    let y = parts.next()?.trim().parse::<f32>().ok()?;
+    let z = parts.next()?.trim().parse::<f32>().ok()?;
+    Some([x, y, z])
 }
 
 fn read_lump_dir(data: &[u8], header_off: usize) -> LumpDir {
@@ -125,13 +144,13 @@ impl Bsp {
             "Bad BSP version: 0x{version_bits:08x} (expected 7.6)"
         );
 
-        // Bounding box
-        let bbox_min = [
+        // Header bounding box (unreliable — we compute from vertices below)
+        let _bbox_min_hdr = [
             read_f32_le(data, 0x08),
             read_f32_le(data, 0x0c),
             read_f32_le(data, 0x10),
         ];
-        let bbox_max = [
+        let _bbox_max_hdr = [
             read_f32_le(data, 0x14),
             read_f32_le(data, 0x18),
             read_f32_le(data, 0x1c),
@@ -253,6 +272,54 @@ impl Bsp {
         let lightmap_data = data[lightmap_lump.offset..lightmap_lump.offset + lightmap_lump.size]
             .to_vec();
 
+        // Compute actual bounds from vertices (header bbox is unreliable)
+        let mut bbox_min = [f32::MAX; 3];
+        let mut bbox_max = [f32::MIN; 3];
+        for v in &vertices {
+            for i in 0..3 {
+                bbox_min[i] = bbox_min[i].min(v.pos[i]);
+                bbox_max[i] = bbox_max[i].max(v.pos[i]);
+            }
+        }
+
+        // Parse EPair lump (32-byte null-terminated strings) for camera spots
+        let epair_lump = read_lump_dir(data, 0x80);
+        let ent_lump = read_lump_dir(data, 0x90);
+        let mut epair_strings = Vec::new();
+        if epair_lump.size > 0 {
+            let count = epair_lump.size / 32;
+            for i in 0..count {
+                let off = epair_lump.offset + i * 32;
+                let s = &data[off..off + 32];
+                let nul = s.iter().position(|&b| b == 0).unwrap_or(32);
+                epair_strings.push(String::from_utf8_lossy(&s[..nul]).into_owned());
+            }
+        }
+
+        // Parse Ent lump (16 bytes each) and extract camera spots (type 7)
+        let mut camera_spots = Vec::new();
+        if ent_lump.size > 0 {
+            let ent_count = ent_lump.size / 16;
+            for i in 0..ent_count {
+                let off = ent_lump.offset + i * 16;
+                let ent_type = read_i16_le(data, off);
+                // raw[4] = epair start index, raw[5] = epair count
+                let epair_start = read_u16_le(data, off + 8) as usize;
+                let epair_count = read_u16_le(data, off + 10) as usize;
+                // Type 10 = camera spot (8 EPairs: flag, pos, dir, dist, ...)
+                if ent_type == 10 && epair_count >= 4 && epair_start + 3 < epair_strings.len() {
+                    // Camera spot: EPair[start+1]=pos, [start+2]=dir, [start+3]=dist
+                    if let (Some(pos), Some(dir), Ok(dist)) = (
+                        parse_vec3(&epair_strings[epair_start + 1]),
+                        parse_vec3(&epair_strings[epair_start + 2]),
+                        epair_strings[epair_start + 3].parse::<f32>(),
+                    ) {
+                        camera_spots.push(BspCameraSpot { pos, dir, dist });
+                    }
+                }
+            }
+        }
+
         println!(
             "BSP: {} verts, {} edges, {} face_edges, {} planes, {} texinfos, {} faces, {} bytes lightmap",
             vertices.len(),
@@ -273,6 +340,13 @@ impl Bsp {
             println!("  {name}");
         }
 
+        println!(
+            "BSP entities: {} epairs, {} ents, {} camera spots",
+            epair_strings.len(),
+            if ent_lump.size > 0 { ent_lump.size / 16 } else { 0 },
+            camera_spots.len(),
+        );
+
         Bsp {
             bbox_min,
             bbox_max,
@@ -283,6 +357,7 @@ impl Bsp {
             texinfos,
             faces,
             lightmap_data,
+            camera_spots,
         }
     }
 

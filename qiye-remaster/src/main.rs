@@ -41,11 +41,11 @@ impl Camera {
 
     /// Horizontal right (on XZ ground plane)
     fn right_xz(&self) -> Vec3 {
-        Vec3::new(-self.yaw.sin(), 0.0, self.yaw.cos())
+        Vec3::new(self.yaw.sin(), 0.0, -self.yaw.cos())
     }
 
     fn view_matrix(&self) -> Mat4 {
-        Mat4::look_at_rh(self.pos, self.pos + self.look_dir(), Vec3::Y)
+        Mat4::look_at_lh(self.pos, self.pos + self.look_dir(), Vec3::Y)
     }
 
     fn update(&mut self, keys: &sdl2::keyboard::KeyboardState, dt: f32) {
@@ -151,31 +151,43 @@ fn main() {
     let bsp_data = fs.read(&bsp_path).unwrap();
     let bsp = bsp::Bsp::parse(bsp_data);
 
-    // Camera at BSP center, speed scaled to level size
+    // Camera: use first BSP camera spot if available, else center of vertex bounds
     let bbox_size = Vec3::new(
         bsp.bbox_max[0] - bsp.bbox_min[0],
         bsp.bbox_max[1] - bsp.bbox_min[1],
         bsp.bbox_max[2] - bsp.bbox_min[2],
     );
-    let min_y = bsp.bbox_min[1].min(bsp.bbox_max[1]);
-    let max_y = bsp.bbox_min[1].max(bsp.bbox_max[1]);
-    let eye_y = min_y + (max_y - min_y) * 0.3; // ~eye height above floor
-    let center = Vec3::new(
-        (bsp.bbox_min[0] + bsp.bbox_max[0]) * 0.5,
-        eye_y,
-        (bsp.bbox_min[2] + bsp.bbox_max[2]) * 0.5,
-    );
     let diagonal = bbox_size.length();
     let cam_speed = (diagonal * 0.15).max(10.0);
+
+    let (start_pos, start_yaw, start_pitch) = if let Some(spot) = bsp.camera_spots.first() {
+        let pos = Vec3::from(spot.pos);
+        let dir = Vec3::from(spot.dir);
+        let yaw = dir.z.atan2(dir.x);
+        let pitch = dir.y.asin();
+        println!(
+            "Using camera spot: pos=({:.1},{:.1},{:.1}) dir=({:.2},{:.2},{:.2})",
+            pos.x, pos.y, pos.z, dir.x, dir.y, dir.z,
+        );
+        (pos, yaw, pitch)
+    } else {
+        let center = Vec3::new(
+            (bsp.bbox_min[0] + bsp.bbox_max[0]) * 0.5,
+            bsp.bbox_min[1] + (bsp.bbox_max[1] - bsp.bbox_min[1]) * 0.3,
+            (bsp.bbox_min[2] + bsp.bbox_max[2]) * 0.5,
+        );
+        (center, 0.0, 0.0)
+    };
+
     println!(
-        "BSP bounds: ({:.0},{:.0},{:.0}) to ({:.0},{:.0},{:.0}), size {:.0}x{:.0}x{:.0}, diagonal {:.0}",
+        "BSP bounds: ({:.0},{:.0},{:.0}) to ({:.0},{:.0},{:.0}), diagonal {:.0}",
         bsp.bbox_min[0], bsp.bbox_min[1], bsp.bbox_min[2],
         bsp.bbox_max[0], bsp.bbox_max[1], bsp.bbox_max[2],
-        bbox_size.x, bbox_size.y, bbox_size.z, diagonal,
+        diagonal,
     );
     println!(
-        "Camera at ({:.0}, {:.0}, {:.0}), speed {:.0} u/s",
-        center.x, center.y, center.z, cam_speed,
+        "Camera at ({:.0}, {:.0}, {:.0}), yaw={:.2} pitch={:.2}, speed {:.0} u/s",
+        start_pos.x, start_pos.y, start_pos.z, start_yaw, start_pitch, cam_speed,
     );
 
     // SDL2 init
@@ -200,20 +212,25 @@ fn main() {
 
     unsafe {
         gl::Enable(gl::DEPTH_TEST);
-        gl::Enable(gl::CULL_FACE);
-        gl::CullFace(gl::BACK);
+        // Disable backface culling for now — BSP face winding needs investigation
+        gl::Disable(gl::CULL_FACE);
         gl::ClearColor(0.1, 0.1, 0.15, 1.0);
     }
 
     // Build renderer
     let renderer = render::BspRenderer::new(&bsp, &fs);
 
-    // Grab mouse
-    sdl.mouse().set_relative_mouse_mode(true);
-
     let mut event_pump = sdl.event_pump().unwrap();
-    let mut camera = Camera::new(center, cam_speed);
+
+    // Enable relative mouse after event pump exists, then flush stale events
+    sdl.mouse().set_relative_mouse_mode(true);
+    event_pump.poll_iter().for_each(drop);
+
+    let mut camera = Camera::new(start_pos, cam_speed);
+    camera.yaw = start_yaw;
+    camera.pitch = start_pitch;
     let mut last_time = std::time::Instant::now();
+    let mut first_mouse = true;
 
     'main: loop {
         for event in event_pump.poll_iter() {
@@ -224,6 +241,10 @@ fn main() {
                     ..
                 } => break 'main,
                 Event::MouseMotion { xrel, yrel, .. } => {
+                    if first_mouse {
+                        first_mouse = false;
+                        continue;
+                    }
                     camera.yaw += xrel as f32 * 0.003;
                     camera.pitch -= yrel as f32 * 0.003;
                     camera.pitch = camera.pitch.clamp(-1.5, 1.5);
@@ -242,7 +263,7 @@ fn main() {
         let (w, h) = window.size();
         if w > 0 && h > 0 {
             let aspect = w as f32 / h as f32;
-            let proj = Mat4::perspective_rh_gl(70.0_f32.to_radians(), aspect, 0.1, 10000.0);
+            let proj = Mat4::perspective_lh(70.0_f32.to_radians(), aspect, 0.1, 10000.0);
             let view = camera.view_matrix();
             let mvp = proj * view;
 
