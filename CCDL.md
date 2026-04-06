@@ -6,9 +6,10 @@ The CCDL (ChinaChip Dynamic Loader) format is the native executable format for
 system. Files use the `.app` extension.
 
 CCDL is a simple relocatable module format. The OS loader reads the headers,
-loads the code segment into memory at a fixed base address, patches import
-relocations to resolve OS/SDK function addresses, then jumps to the exported
-`AppMain` entry point.
+loads the code segment into memory at the base address, patches import
+relocations to resolve OS/SDK function addresses, runs the CRT entry point
+(which performs BSS zeroing and framebuffer allocation), then creates an
+RTOS task for the exported `AppMain` function.
 
 ---
 
@@ -24,7 +25,7 @@ relocations to resolve OS/SDK function addresses, then jumps to the exported
 | RAWD Header      | 0x060    | 0x20 (32 bytes) + 0x20 padding           |
 | Import Table     | varies   | sub-header + entries + name strings      |
 | Export Table     | varies   | sub-header + entries + name strings      |
-| Code + Data      | varies   | raw MIPS code loaded at vaddr            |
+| Code + Data      | varies   | raw MIPS code loaded at load address     |
 | Padding          | varies   | 0xFF fill to next aligned boundary       |
 | Resource Pack    | varies   | optional embedded resource filesystem     |
 +------------------+----------+------------------------------------------+
@@ -79,22 +80,22 @@ All zeros (reserved).
 Offset  Size  Field
 ------  ----  -----
 0x10    4     Reserved (0)
-0x14    4     Load virtual address (where code is mapped in memory)
-0x18    4     Base address (page-aligned base, typically load_vaddr & ~0xFFF)
+0x14    4     Entry point virtual address (CRT init code entry)
+0x18    4     Load address (where RAWD data is mapped in memory)
 0x1C    4     Memory size (code + data + BSS, >= data size on disk)
               BSS size = memory_size - data_size
 ```
 
 Example from `qiye.app`:
 
-| Field          | Value          | Notes                      |
-|----------------|----------------|----------------------------|
-| Data offset    | `0x970`        | Code starts here in file   |
-| Data size      | `0x13A2E0`     | 1,286,880 bytes (~1.2 MB)  |
-| Load vaddr     | `0x80A000A0`   | Loaded here in RAM         |
-| Base addr      | `0x80A00000`   | Page-aligned base          |
-| Memory size    | `0x144880`     | 1,329,280 bytes            |
-| BSS size       | `0xA5A0`       | 42,400 bytes (zeroed)      |
+| Field          | Value          | Notes                              |
+|----------------|----------------|------------------------------------|
+| Data offset    | `0x970`        | RAWD data starts here in file      |
+| Data size      | `0x13A2E0`     | 1,286,880 bytes (~1.2 MB)          |
+| Entry point    | `0x80A000A0`   | CRT init entry (within loaded seg) |
+| Load address   | `0x80A00000`   | RAWD data loaded here in RAM       |
+| Memory size    | `0x144880`     | 1,329,280 bytes                    |
+| BSS size       | `0xA5A0`       | 42,400 bytes (zeroed)              |
 
 ---
 
@@ -123,9 +124,14 @@ Offset  Size  Field
 0x0C    4     Target virtual address (where the loader patches)
 ```
 
-The **target virtual address** points to a location within the loaded code
-segment. The OS loader writes a jump instruction (or function pointer) at this
-address to redirect calls to the real OS function.
+The **target virtual address** identifies the import's stub address within the
+code segment. The OS loader resolves the named function and patches all `JAL`
+instructions in the code that target this address, rewriting their 26-bit target
+field to point to the resolved OS function. The code at the stub address itself
+is **not** modified — early imports often overlap with CRT function code
+(epilogues, branches), so overwriting them would corrupt the program. The stubs
+(typically `NOP; JR $RA`) serve as default no-op implementations when an import
+is unresolved.
 
 ### Name String Pool
 
@@ -189,24 +195,26 @@ Offset  Size  Field
 | Name      | Address        | Purpose                                |
 |-----------|----------------|----------------------------------------|
 | `getext`  | `0x80A0018C`   | Text/localization getter function      |
-| `AppMain` | `0x80A001A4`   | Application entry point (called by OS) |
+| `AppMain` | `0x80A001A4`   | RTOS task entry (called via OSTaskCreate) |
 
-`AppMain` is the mandatory entry point. The OS calls it after loading and
-relocating the module.
+`AppMain` is the RTOS task entry point. The OS does **not** call it directly.
+Instead, after running the CRT entry point (from the RAWD header), the OS
+creates an RTOS task via `OSTaskCreate(AppMain, ...)` which schedules it
+for execution with `argc`/`argv` in `$a0`/`$a1`.
 
 ---
 
 ## Code + Data Segment
 
-Raw MIPS32 (little-endian) machine code. The segment is loaded at the virtual
-address specified in the RAWD header (`load_vaddr`). After loading, the BSS
-region (memory\_size - data\_size bytes) following the loaded data is zeroed.
+Raw MIPS32 (little-endian) machine code. The segment is loaded at the
+load address specified in the RAWD header. After loading, the BSS region
+(memory\_size - data\_size bytes) following the loaded data is zeroed.
 
 Address translation:
 
 ```
-file_offset = rawd.data_offset + (virtual_address - rawd.load_vaddr)
-virtual_address = rawd.load_vaddr + (file_offset - rawd.data_offset)
+file_offset = rawd.data_offset + (virtual_address - rawd.load_address)
+virtual_address = rawd.load_address + (file_offset - rawd.data_offset)
 ```
 
 ---
@@ -275,13 +283,14 @@ File types:
 
 1. Read CCDL header, verify magic and version
 2. Parse IMPT, EXPT, RAWD section headers
-3. Allocate memory at `base_addr`, size = `memory_size`
-4. Read code+data from file into memory at `load_vaddr`
-5. Zero the BSS region (`load_vaddr + data_size` to `load_vaddr + memory_size`)
-6. For each import entry: resolve the named OS function and patch the target
-   address in the loaded code with a jump/call to the resolved address
+3. Allocate memory at load address, size = `memory_size`
+4. Read code+data from file into memory at load address
+5. Zero the BSS region (`load_address + data_size` to `load_address + memory_size`)
+6. For each import entry: resolve the named OS function and patch all `JAL`
+   instructions targeting that stub address to jump to the resolved function
 7. Flush instruction cache (`__icache_invalidate_all`)
-8. Call `AppMain` export
+8. Call CRT entry point (from RAWD header) — performs app-level init
+9. Create RTOS task: `OSTaskCreate(AppMain, argc_argv, stack, priority)`
 
 ---
 

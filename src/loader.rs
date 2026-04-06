@@ -16,8 +16,8 @@ pub struct ExportEntry {
 pub struct CcdlBinary {
     pub imports: Vec<ImportEntry>,
     pub exports: Vec<ExportEntry>,
-    pub load_vaddr: u32,
-    pub base_addr: u32,
+    pub entry_point: u32,
+    pub load_address: u32,
     pub data_size: u32,
     pub memory_size: u32,
 }
@@ -65,8 +65,8 @@ pub fn parse_ccdl(data: &[u8]) -> CcdlBinary {
     let (expt_off, _expt_sz) = parse_section_hdr(data, 0x40, b"EXPT");
     let (_rawd_off, rawd_sz) = parse_section_hdr(data, 0x60, b"RAWD");
 
-    let load_vaddr = read_u32_le(data, 0x74);
-    let base_addr = read_u32_le(data, 0x78);
+    let entry_point = read_u32_le(data, 0x74);
+    let load_address = read_u32_le(data, 0x78);
     let memory_size = read_u32_le(data, 0x7C);
 
     let imports: Vec<ImportEntry> = parse_table(data, impt_off)
@@ -85,8 +85,8 @@ pub fn parse_ccdl(data: &[u8]) -> CcdlBinary {
     CcdlBinary {
         imports,
         exports,
-        load_vaddr,
-        base_addr,
+        entry_point,
+        load_address,
         data_size: rawd_sz,
         memory_size,
     }
@@ -95,17 +95,17 @@ pub fn parse_ccdl(data: &[u8]) -> CcdlBinary {
 pub fn load_ccdl(data: &[u8], mem: &mut Memory) -> CcdlBinary {
     let ccdl = parse_ccdl(data);
 
-    // Load code+data into guest memory at load_vaddr
+    // Load code+data into guest memory at load_address
     let rawd_off = {
         let (off, _) = parse_section_hdr(data, 0x60, b"RAWD");
         off as usize
     };
     let code = &data[rawd_off..rawd_off + ccdl.data_size as usize];
-    let dest = mem.slice_mut(ccdl.load_vaddr, code.len());
+    let dest = mem.slice_mut(ccdl.load_address, code.len());
     dest.copy_from_slice(code);
 
     // Zero BSS
-    let bss_start = ccdl.load_vaddr + ccdl.data_size;
+    let bss_start = ccdl.load_address + ccdl.data_size;
     let bss_size = ccdl.memory_size - ccdl.data_size;
     if bss_size > 0 {
         let bss = mem.slice_mut(bss_start, bss_size as usize);
@@ -140,8 +140,8 @@ mod tests {
         assert_eq!(ccdl.exports[1].name, "AppMain");
         assert_eq!(ccdl.exports[1].vaddr, 0x80A0_01A4);
 
-        assert_eq!(ccdl.load_vaddr, 0x80A0_00A0);
-        assert_eq!(ccdl.base_addr, 0x80A0_0000);
+        assert_eq!(ccdl.entry_point, 0x80A0_00A0);
+        assert_eq!(ccdl.load_address, 0x80A0_0000);
         assert_eq!(ccdl.memory_size, 0x14_4880);
     }
 

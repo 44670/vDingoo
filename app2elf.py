@@ -59,8 +59,8 @@ def parse_ccdl(data):
     impt = parse_section_hdr(0x20, b'IMPT')
     expt = parse_section_hdr(0x40, b'EXPT')
     rawd = parse_section_hdr(0x60, b'RAWD')
-    _, load_vaddr, base_addr, mem_size = struct.unpack_from('<IIII', data, 0x70)
-    rawd.update(load_vaddr=load_vaddr, base_addr=base_addr, memory_size=mem_size)
+    _, entry_point, load_address, mem_size = struct.unpack_from('<IIII', data, 0x70)
+    rawd.update(entry_point=entry_point, load_address=load_address, memory_size=mem_size)
 
     def parse_table(sec):
         off = sec['data_offset']
@@ -84,18 +84,13 @@ def parse_ccdl(data):
 
 def ccdl_to_elf(ccdl):
     rawd = ccdl['rawd']
-    load_vaddr = rawd['load_vaddr']
-    base_addr = rawd['base_addr']
+    load_address = rawd['load_address']
+    entry_point = rawd['entry_point']
     code = ccdl['code']
     code_size = len(code)
     bss_size = rawd['memory_size'] - rawd['data_size']
-    pre_gap = load_vaddr - base_addr
 
-    entry = load_vaddr
-    for exp in ccdl['exports']:
-        if exp['name'] == 'AppMain':
-            entry = exp['vaddr']
-            break
+    entry = entry_point
 
     # String table (.strtab)
     strtab = bytearray(b'\x00')
@@ -132,8 +127,7 @@ def ccdl_to_elf(ccdl):
     # Layout
     phnum = 1
     code_off = 52 + phnum * 32  # right after ELF header + phdrs
-    full_code = b'\x00' * pre_gap + code  # zero-fill base_addr..load_vaddr gap
-    symtab_off = code_off + len(full_code)
+    symtab_off = code_off + len(code)
     strtab_off = symtab_off + len(symtab_data)
     shstrtab_off = strtab_off + len(strtab_data)
     shdr_off = (shstrtab_off + len(shstrtab_data) + 3) & ~3
@@ -144,9 +138,9 @@ def ccdl_to_elf(ccdl):
     shdrs = [
         _shdr(0, SHT_NULL, 0, 0, 0, 0),
         _shdr(n_text, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR | SHF_WRITE,
-              base_addr, code_off, len(full_code)),
+              load_address, code_off, code_size),
         _shdr(n_bss, SHT_NOBITS, SHF_ALLOC | SHF_WRITE,
-              load_vaddr + code_size, code_off + len(full_code), bss_size),
+              load_address + code_size, code_off + code_size, bss_size),
         _shdr(n_symtab, SHT_SYMTAB, 0, 0, symtab_off, len(symtab_data),
               link=4, info=1, entsize=16),
         _shdr(n_strtab, SHT_STRTAB, 0, 0, strtab_off, len(strtab_data), align=1),
@@ -155,9 +149,9 @@ def ccdl_to_elf(ccdl):
 
     out = bytearray()
     out += _ehdr(entry, 52, shdr_off, e_flags, phnum, len(shdrs), 5)
-    out += _phdr(code_off, base_addr, len(full_code),
-                 pre_gap + code_size + bss_size, PF_R | PF_W | PF_X)
-    out += full_code
+    out += _phdr(code_off, load_address, code_size,
+                 code_size + bss_size, PF_R | PF_W | PF_X)
+    out += code
     out += symtab_data
     out += strtab_data
     out += shstrtab_data
@@ -180,8 +174,8 @@ def main():
     rawd = ccdl['rawd']
     bss = rawd['memory_size'] - rawd['data_size']
     print(f"CCDL: {inp.name}")
-    print(f"  Load address: 0x{rawd['load_vaddr']:08X}")
-    print(f"  Base address: 0x{rawd['base_addr']:08X}")
+    print(f"  Load address: 0x{rawd['load_address']:08X}")
+    print(f"  Entry point:  0x{rawd['entry_point']:08X}")
     print(f"  Code size:    0x{rawd['data_size']:X} ({rawd['data_size']:,} bytes)")
     print(f"  Memory size:  0x{rawd['memory_size']:X} ({rawd['memory_size']:,} bytes)")
     print(f"  BSS size:     0x{bss:X} ({bss:,} bytes)")

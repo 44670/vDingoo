@@ -3,3 +3,4 @@
 .claude
 target
 __pycache__
+*.bndb
