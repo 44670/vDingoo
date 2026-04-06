@@ -100,6 +100,25 @@ pub struct BspCameraSpot {
     pub dist: f32,
 }
 
+/// A raw entity from the BSP Ent lump.
+/// 16 bytes per entry: type(i16), model_idx(i16), ebrush_start(u16), ebrush_count(i16),
+///                      epair_start(u16), epair_count(i16), elink_idx(i16), reserved(i16)
+#[derive(Debug, Clone)]
+pub struct BspEntity {
+    pub entity_type: i16,
+    pub model_idx: i16,
+    pub epair_start: u16,
+    pub epair_count: u16,
+    /// Parsed position from EPairs (if available)
+    pub position: Option<[f32; 3]>,
+    /// Parsed 3x3 transform matrix rows from EPairs (if available)
+    pub transform: Option<[[f32; 3]; 3]>,
+    /// Parsed model name from EPairs (if available)
+    pub model_name: Option<String>,
+    /// Parsed bounding box extents from EPairs (if available)
+    pub bbox: Option<[f32; 3]>,
+}
+
 pub struct Bsp {
     pub bbox_min: [f32; 3],
     pub bbox_max: [f32; 3],
@@ -111,6 +130,8 @@ pub struct Bsp {
     pub faces: Vec<BspFace>,
     pub lightmap_data: Vec<u8>,
     pub camera_spots: Vec<BspCameraSpot>,
+    pub entities: Vec<BspEntity>,
+    pub epair_strings: Vec<String>,
 }
 
 struct LumpDir {
@@ -282,7 +303,7 @@ impl Bsp {
             }
         }
 
-        // Parse EPair lump (32-byte null-terminated strings) for camera spots
+        // Parse EPair lump (32-byte null-terminated strings)
         let epair_lump = read_lump_dir(data, 0x80);
         let ent_lump = read_lump_dir(data, 0x90);
         let mut epair_strings = Vec::new();
@@ -296,28 +317,98 @@ impl Bsp {
             }
         }
 
-        // Parse Ent lump (16 bytes each) and extract camera spots (type 7)
+        // Parse Ent lump (16 bytes each): type(i16), model_idx(i16),
+        //   ebrush_start(u16), ebrush_count(i16), epair_start(u16), epair_count(i16),
+        //   elink_idx(i16), reserved(i16)
         let mut camera_spots = Vec::new();
+        let mut entities = Vec::new();
         if ent_lump.size > 0 {
             let ent_count = ent_lump.size / 16;
             for i in 0..ent_count {
                 let off = ent_lump.offset + i * 16;
                 let ent_type = read_i16_le(data, off);
-                // raw[4] = epair start index, raw[5] = epair count
-                let epair_start = read_u16_le(data, off + 8) as usize;
-                let epair_count = read_u16_le(data, off + 10) as usize;
-                // Type 10 = camera spot (8 EPairs: flag, pos, dir, dist, ...)
-                if ent_type == 10 && epair_count >= 4 && epair_start + 3 < epair_strings.len() {
-                    // Camera spot: EPair[start+1]=pos, [start+2]=dir, [start+3]=dist
+                let model_idx = read_i16_le(data, off + 2);
+                let epair_start = read_u16_le(data, off + 8);
+                let epair_count = read_u16_le(data, off + 10);
+
+                let ep_start = epair_start as usize;
+                let ep_count = epair_count as usize;
+
+                // Extract camera spots (type 10)
+                if ent_type == 10 && ep_count >= 4 && ep_start + 3 < epair_strings.len() {
                     if let (Some(pos), Some(dir), Ok(dist)) = (
-                        parse_vec3(&epair_strings[epair_start + 1]),
-                        parse_vec3(&epair_strings[epair_start + 2]),
-                        epair_strings[epair_start + 3].parse::<f32>(),
+                        parse_vec3(&epair_strings[ep_start + 1]),
+                        parse_vec3(&epair_strings[ep_start + 2]),
+                        epair_strings[ep_start + 3].parse::<f32>(),
                     ) {
                         camera_spots.push(BspCameraSpot { pos, dir, dist });
                     }
                 }
+
+                // Parse entity fields from EPairs
+                let mut position = None;
+                let mut transform = None;
+                let mut model_name = None;
+                let mut bbox = None;
+
+                if ep_count > 0 && ep_start < epair_strings.len() {
+                    // Type 0 entities (scene objects): EPair layout is
+                    //   [0]=model_name, [1]=null, [2-4]=flags,
+                    //   [5-7]=transform 3x3, [8]=position, [9]=bbox, [10]=flag
+                    if ent_type == 0 && ep_count >= 9 {
+                        let name = &epair_strings[ep_start];
+                        if !name.is_empty() && name != "0" {
+                            model_name = Some(name.clone());
+                        }
+                        // Transform rows at EPair[5..8]
+                        if ep_start + 7 < epair_strings.len() {
+                            if let (Some(r0), Some(r1), Some(r2)) = (
+                                parse_vec3(&epair_strings[ep_start + 5]),
+                                parse_vec3(&epair_strings[ep_start + 6]),
+                                parse_vec3(&epair_strings[ep_start + 7]),
+                            ) {
+                                transform = Some([r0, r1, r2]);
+                            }
+                        }
+                        // Position at EPair[8]
+                        if ep_start + 8 < epair_strings.len() {
+                            position = parse_vec3(&epair_strings[ep_start + 8]);
+                        }
+                        // Bbox at EPair[9]
+                        if ep_start + 9 < epair_strings.len() {
+                            bbox = parse_vec3(&epair_strings[ep_start + 9]);
+                        }
+                    } else if ent_type == 10 && ep_count >= 2 {
+                        // Camera spot: position is EPair[1]
+                        if ep_start + 1 < epair_strings.len() {
+                            position = parse_vec3(&epair_strings[ep_start + 1]);
+                        }
+                    }
+                }
+
+                entities.push(BspEntity {
+                    entity_type: ent_type,
+                    model_idx,
+                    epair_start,
+                    epair_count,
+                    position,
+                    transform,
+                    model_name,
+                    bbox,
+                });
             }
+        }
+
+        // Print entity type summary
+        let mut type_counts: std::collections::HashMap<i16, usize> = std::collections::HashMap::new();
+        for ent in &entities {
+            *type_counts.entry(ent.entity_type).or_default() += 1;
+        }
+        let mut type_list: Vec<_> = type_counts.into_iter().collect();
+        type_list.sort_by_key(|&(t, _)| t);
+        println!("BSP entity types:");
+        for (t, c) in &type_list {
+            println!("  type {t}: {c} entities");
         }
 
         println!(
@@ -358,6 +449,8 @@ impl Bsp {
             faces,
             lightmap_data,
             camera_spots,
+            entities,
+            epair_strings,
         }
     }
 

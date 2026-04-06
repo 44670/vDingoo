@@ -1,6 +1,8 @@
 use crate::bsp::{Bsp, BspFace, BspTexinfo};
+use crate::entity::EntityManager;
 use crate::fs_app::AppFs;
 use crate::texture;
+use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 use std::ffi::CString;
 
@@ -561,6 +563,132 @@ impl BspRenderer {
                     dc.index_count as i32,
                     gl::UNSIGNED_INT,
                     (dc.index_offset * std::mem::size_of::<u32>()) as *const _,
+                );
+            }
+
+            gl::BindVertexArray(0);
+        }
+    }
+}
+
+// === Debug entity cube renderer ===
+
+const DEBUG_VS: &str = r#"
+#version 330 core
+layout (location = 0) in vec3 aPos;
+uniform mat4 u_mvp;
+uniform vec3 u_color;
+out vec3 vColor;
+void main() {
+    gl_Position = u_mvp * vec4(aPos, 1.0);
+    vColor = u_color;
+}
+"#;
+
+const DEBUG_FS: &str = r#"
+#version 330 core
+in vec3 vColor;
+out vec4 FragColor;
+void main() {
+    FragColor = vec4(vColor, 1.0);
+}
+"#;
+
+/// Unit cube vertices (8 corners of a [-0.5, 0.5] cube)
+const CUBE_VERTS: [[f32; 3]; 8] = [
+    [-0.5, -0.5, -0.5], [ 0.5, -0.5, -0.5],
+    [ 0.5,  0.5, -0.5], [-0.5,  0.5, -0.5],
+    [-0.5, -0.5,  0.5], [ 0.5, -0.5,  0.5],
+    [ 0.5,  0.5,  0.5], [-0.5,  0.5,  0.5],
+];
+
+/// Line indices for wireframe cube (12 edges × 2 indices)
+const CUBE_LINES: [u16; 24] = [
+    0,1, 1,2, 2,3, 3,0,  // front face
+    4,5, 5,6, 6,7, 7,4,  // back face
+    0,4, 1,5, 2,6, 3,7,  // connecting edges
+];
+
+pub struct DebugRenderer {
+    vao: u32,
+    shader: u32,
+    u_mvp: i32,
+    u_color: i32,
+}
+
+impl DebugRenderer {
+    pub fn new() -> Self {
+        let vs = compile_shader(DEBUG_VS, gl::VERTEX_SHADER);
+        let fs = compile_shader(DEBUG_FS, gl::FRAGMENT_SHADER);
+        let shader = link_program(vs, fs);
+
+        let u_mvp = unsafe {
+            let name = CString::new("u_mvp").unwrap();
+            gl::GetUniformLocation(shader, name.as_ptr())
+        };
+        let u_color = unsafe {
+            let name = CString::new("u_color").unwrap();
+            gl::GetUniformLocation(shader, name.as_ptr())
+        };
+
+        let (mut vao, mut vbo, mut ebo) = (0u32, 0u32, 0u32);
+        unsafe {
+            gl::GenVertexArrays(1, &mut vao);
+            gl::GenBuffers(1, &mut vbo);
+            gl::GenBuffers(1, &mut ebo);
+
+            gl::BindVertexArray(vao);
+
+            gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                std::mem::size_of_val(&CUBE_VERTS) as isize,
+                CUBE_VERTS.as_ptr() as *const _,
+                gl::STATIC_DRAW,
+            );
+
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
+            gl::BufferData(
+                gl::ELEMENT_ARRAY_BUFFER,
+                std::mem::size_of_val(&CUBE_LINES) as isize,
+                CUBE_LINES.as_ptr() as *const _,
+                gl::STATIC_DRAW,
+            );
+
+            gl::VertexAttribPointer(0, 3, gl::FLOAT, gl::FALSE, 12, std::ptr::null());
+            gl::EnableVertexAttribArray(0);
+            gl::BindVertexArray(0);
+        }
+
+        DebugRenderer { vao, shader, u_mvp, u_color }
+    }
+
+    /// Render all entities as colored wireframe cubes.
+    pub fn render_entities(&self, vp: &Mat4, entities: &EntityManager) {
+        unsafe {
+            gl::UseProgram(self.shader);
+            gl::BindVertexArray(self.vao);
+            gl::LineWidth(2.0);
+
+            for ent in entities.entities() {
+                if !ent.active {
+                    continue;
+                }
+
+                let scale = ent.bbox_extents.max_element().max(1.0);
+                let model = Mat4::from_translation(ent.transform.position)
+                    * Mat4::from_scale(Vec3::splat(scale));
+                let mvp = *vp * model;
+
+                gl::UniformMatrix4fv(self.u_mvp, 1, gl::FALSE, mvp.as_ref().as_ptr());
+                let color = ent.type_id.color();
+                gl::Uniform3f(self.u_color, color[0], color[1], color[2]);
+
+                gl::DrawElements(
+                    gl::LINES,
+                    CUBE_LINES.len() as i32,
+                    gl::UNSIGNED_SHORT,
+                    std::ptr::null(),
                 );
             }
 

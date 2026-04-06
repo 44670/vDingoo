@@ -845,6 +845,11 @@ State 4: SCENE_EXIT (36 tick cleanup)
 | `.sbn` | Font/string binary data |
 | `.sdt` | State data tables |
 | `.sst` | Script scene trees (typed node archive) |
+| `.soj` | 3D model (vertices, indices, materials, skeleton refs) |
+| `.sai` | Skeletal animation (bone matrices, keyframes) |
+| `.stx` | Texture (RGB565, RGBA4444, etc.) |
+| `.sau` | Audio (custom ADPCM, 16kHz mono) |
+| `.spl` | Spline curve data (camera paths) |
 | `.s3dsty` | s3d engine style/config |
 | `.sav` | Save game slots (AES-128 encrypted) |
 | BSP (custom) | 3D level: geometry, lightmaps, PVS, entities, nav mesh |
@@ -1131,4 +1136,248 @@ that gets patched by the OS loader. In the ELF they appear as named functions.
 0x80a003e0  GetTickCount   0x80a003e8  _sys_judge_event
 0x80a003f0  fsys_fopenW    0x80a003f8  __to_unicode_le
 0x80a00400  __to_locale_ansi  0x80a00408  get_current_language
+```
+
+## SOJ Model Format (`.soj`)
+
+No magic bytes or version header. Flat sequential binary, all values little-endian.
+Loaded by `Object_loadFromMemory` at `0x80a90cb4`.
+
+### Top-level layout
+
+```
+i32       submesh_count                    -- material slot count
+[52 bytes × submesh_count]                -- SubMeshEntry array
+i32       material_count                   -- geometry group count
+i32       field_b8                         -- unknown (ObjectRes+0xb8)
+i32       field_bc                         -- unknown (ObjectRes+0xbc)
+[variable × material_count]               -- MaterialGroup array (inline VB+IB)
+i32[6]    bbox (min_xyz, max_xyz)          -- 16.16 fixed-point bounding box
+```
+
+### SubMeshEntry (52 bytes / 0x34)
+
+```
++0x00  i32[2]   packed_base_name        -- PackedString (base texture name)
++0x08  u8       color_r
++0x09  u8       color_g
++0x0a  u8       color_b
++0x0b  u8       alpha                   -- 255 = opaque
++0x0c  u16      alpha_ref               -- 0xFF = alpha test enabled
++0x10  u16      draw_order              -- rendering priority
++0x14  i32[4]   texture_name            -- PackedString (4 words, up to 24 chars)
++0x24  i32      scroll_u                -- texture scroll speed (16.16 fp)
++0x28  i32      scroll_v
++0x2c  i32      has_alpha_blend         -- if !=0: render_mode=3
++0x30  i32      has_additive            -- if !=0 and !alpha_blend: render_mode=4
+```
+
+### MaterialGroup (variable size)
+
+```
+i32      submesh_index          -- index into SubMeshEntry array (-1 = unused)
+i32      primitive_type         -- 4 = triangle list, 5 = triangle strip
+i32      face_count             -- triangle count (list) or strip segments (strip)
+-- VertexBuffer (inline) --
+-- IndexBuffer (inline) --
+```
+
+Index count: tri_list = face_count × 3, tri_strip = face_count + 2.
+
+### VertexBuffer (inline)
+
+```
+i32      format_flags           -- bitmask: 0x02=normals, 0x04=UV, 0x08=color, 0x10=bone
+i32      stride_bytes           -- bytes per vertex
+i32      vertex_count
+i32      data_size              -- = stride_bytes × vertex_count
+[data_size bytes]               -- vertex data, all i32 16.16 fixed-point
+```
+
+Per-vertex layout (sequential i32 fields, all 16.16 fixed-point):
+```
+[bone_index: i32]      -- if format & 0x10
+position_x: i32        -- always present
+position_y: i32
+position_z: i32
+[normal_x: i32]        -- if format & 0x02
+[normal_y: i32]
+[normal_z: i32]
+[tex_u: i32]           -- if format & 0x04
+[tex_v: i32]
+[color: i32]           -- if format & 0x08 (RGB565)
+```
+
+### IndexBuffer (inline)
+
+```
+i32      format                 -- index buffer format
+i32      data_size              -- total bytes
+[data_size bytes]               -- u16 indices
+```
+
+### Key Functions
+
+| Address | Name |
+|---------|------|
+| `0x80a90cb4` | `Object_loadFromMemory` (main SOJ parser) |
+| `0x80a9043c` | `Particle_parseData` (SubMeshEntry deserializer) |
+| `0x80acec20` | `SoundSource_deserialize` (MaterialGroup deserializer) |
+| `0x80a5ddc0` | `Lightmap_deserialize` (VertexBuffer deserializer) |
+| `0x80acf5b0` | `AnimTrack_deserialize` (IndexBuffer deserializer) |
+
+## Key Struct Layouts
+
+All offsets are byte offsets from `this`. All 3D coordinates use 16.16 fixed-point (0x10000 = 1.0).
+
+### GameEngine (size 0xAB7C, vtable 0x80ad9980)
+
+```c
++0x00   void*          vtable
++0x80   ResFactory*    resFactory          // operator_new(0xB0C)
++0x84   void*          resourcePak         // operator_new(0x70)
++0x88   SoundManager*  soundManager        // operator_new(0x9C)
++0x8C   InputSlot*     inputSlot           // operator_new(0x31)
++0x90   void*          orthoCam            // operator_new(0x168)
++0x94   Renderer*      renderer            // operator_new(0x1A388)
++0x98   Raster*        raster              // operator_new(0x134)
++0xA4   Scene*         scene               // operator_new(0x6348)
++0x6568 DialogManager* dialogMgr           // operator_new(0xCC)
++0x6580 AnimController animCtrl            // inline
++0x9A3C ScriptTable    scriptTable         // inline
+```
+
+### Scene (size 0x6348, vtable 0x80adb500)
+
+```c
++0x00   void*          vtable
++0x08   GameEngine*    engine
++0x38   int32_t        dayNumber
++0x3C   int32_t        floorNumber
++0x40   Bsp*           bsp                 // operator_new(0x2BDEC)
++0x44   SplineCurve*   defaultSpline       // 1000.spl
++0x4C   Camera         camera              // inline (~0x210 bytes)
++0x254  Player*        player
++0x760  SDT*           sdt
++0x768  Renderer*      renderer
++0x770  GameData*      gameData
++0x774  GameEngine*    engineBackref
++0x90C  DialogManager* dialogMgr
++0x9C8  int32_t        transitionState     // 0-4 state machine
++0x9EC  GameUnit*      levelModel          // background model
+```
+
+### GameUnit (base entity, size 0x90, vtable 0x80ade5a0)
+
+```c
++0x00   void*          vtable
++0x04   int32_t        entity_type         // 1=GameUnit, 2=Creature, 9=Player, 0x1b=Enemy
++0x08   int32_t        entity_id           // -1 initially
++0x0C   vec3_fp        position            // 3× i32
++0x18   vec3_fp        aabb_min            // local AABB
++0x24   vec3_fp        aabb_max
++0x30   vec3_fp        world_aabb_min      // = pos + aabb_min
++0x3C   vec3_fp        world_aabb_max
++0x48   GameUnit*      next                // entity linked list
++0x4C   int32_t        active              // 1 = active
++0x50   int32_t        visible             // 1 = visible
++0x54   void*          lod_model           // LODModel* (mesh + LOD)
++0x70   Scene*         scene               // backpointer
+```
+
+### Object (3D renderable model, ~0x20C bytes, vtable 0x80ad9358)
+
+```c
++0x00   void*          vtable
++0x18   vec3_fp        position
++0x24   int32_t[9]     rotation_3x3        // 16.16 fp rotation matrix
++0x48   vec3_fp        scale               // (0x10000, 0x10000, 0x10000) = 1.0
++0x54   int32_t        submesh_count
++0x58   void*          submeshes           // Particle* array
++0x60   int32_t        alpha
++0x69   uint8_t        lighting_enabled
++0x6C   Object*        parent              // parent Object*
++0x70   vec3_fp        local_bbox_min
++0x7C   vec3_fp        local_bbox_max
++0x11C  void*          render_func         // = GameUnit_renderModel
++0x124  void*          soj_model           // SOJ resource ptr
++0x128  void*          anim_resource       // SAI resource ptr
++0x12C  int32_t        anim_paused
++0x130  int32_t        anim_time
++0x134  int32_t        anim_direction      // 1=forward, -1=backward
++0x138  int32_t        anim_loop_mode      // 1=loop
++0x13C  int32_t        anim_speed          // default 0x12C (300)
++0x144  mat4_fp        world_matrix        // 16× i32
++0x184  mat4_fp        local_matrix
+```
+
+### Camera (inline at Scene+0x4C, ~0x210 bytes)
+
+```c
++0x00   int32_t        mode                // 0=none,1=follow,2=orbit,3=chase,4=static,5=free,6=cinematic,7=path
++0x1C   vec3_fp        eye_pos
++0x28   vec3_fp        look_at
++0x34   vec3_fp        up                  // init {0, 0x10000, 0}
++0x40   vec3_fp        target_desired
++0x4C   vec3_fp        right
++0x58   vec3_fp        forward
++0x104  GameUnit*      attachedEntity
++0x154  int32_t        shakeActive         // shake frames remaining
++0x158  int32_t        shakeIntensity
++0x168  int32_t        shakeAmplitude
+```
+
+### Player (extends Creature/CameraTrigger, ~0xF40 bytes, vtable 0x80adaab0)
+
+```c
++0x0C   vec3_fp        position            // inherited from GameUnit
++0x6F0  StateMachine   state_machine       // inline, 0x10 bytes
++0x700  DummySpot      camera_spot
++0x7AC  void*          input_mapping
++0x7B4  Sword*         sword               // operator_new(0x27C)
++0x860  vec3_fp        impulse             // physics impulse (damped ×0xF333/frame)
+```
+
+### StateMachine (0x10 bytes, vtable 0x80adab48)
+
+```c
++0x00   void*          vtable
++0x04   State*         current_state
++0x08   State*         pending_state       // active sub-state
++0x0C   State*         next_state          // queued transition
+```
+
+Player states: Stand(0), Run(1), AttackA1-C3(2-10), Hurt1-4(11-14), Die(15), Push(16), QTE(17), Hide(18), FPS(19).
+
+### AudioDevice (size 0x1AC)
+
+```c
++0x00   int32_t        master_volume       // 0-255
++0x04   void*[16]      pcm_data            // per-channel PCM pointer
++0x44   int32_t[16]    buffer_len
++0x84   int32_t[16]    play_pos
++0xC4   int32_t[16]    channel_vol         // 0-7, default 7
++0x104  int32_t[16]    loop_flag           // 0=one-shot, 1=loop
++0x144  int32_t[16]    is_playing          // 1=stopped, 0=active
++0x184  void*          sem_mix             // OSSemCreate(1)
++0x188  void*          sem_write
++0x190  int32_t*       mix_buffer          // 0x640 bytes (400 samples)
++0x194  int16_t*       out_buffer          // 0x320 bytes
++0x198  void*          waveout_handle
++0x19C  int32_t        sample_rate         // 0x3E80 = 16kHz
++0x1A0  int16_t        bits_per_sample     // 16
++0x1A2  uint8_t        channels_mono       // 1 = mono
+```
+
+### ObjectRes (SOJ runtime object, 0xDC bytes)
+
+```c
++0x00   void*          vtable
++0x04   int32_t        ref_count
++0xAC   int32_t        submesh_count
++0xB0   void*          submesh_array       // SubMeshEntry*
++0xB4   int32_t        material_count
++0xC0   void*          material_array      // MaterialGroup*
++0xC4   vec3_fp        bbox_min            // 16.16 fp
++0xD0   vec3_fp        bbox_max
 ```
