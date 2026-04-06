@@ -1,15 +1,271 @@
-mod hle;
 mod loader;
 mod mem;
 mod mips;
 
-use hle::HleState;
+use loader::ImportEntry;
 use loader::load_ccdl;
 use mem::Memory;
 use mips::{Cpu, StepResult};
 
+// ── Constants ──────────────────────────────────────────────────────────────────
+
 const SENTINEL_RA: u32 = 0xDEAD_0000;
 const DEFAULT_SP: u32 = 0x8001_0000;
+const HEAP_BASE: u32 = 0x9800_0000;
+const HLE_BASE: u32 = 0x8000_0000;
+const LCD_FRAMEBUF: u32 = 0x80F0_0000;
+
+// ── HLE State ──────────────────────────────────────────────────────────────────
+
+type HleFn = fn(&mut Cpu, &mut Memory, &mut HleState);
+
+pub struct HleState {
+    handlers: Vec<HleFn>,
+    names: Vec<String>,
+    pub heap_ptr: u32,
+    pub alloc_sizes: std::collections::HashMap<u32, u32>,
+    sem_counter: u32,
+}
+
+impl HleState {
+    pub fn new(imports: &[ImportEntry], mem: &mut Memory) -> Self {
+        let mut state = Self {
+            handlers: Vec::new(),
+            names: Vec::new(),
+            heap_ptr: HEAP_BASE,
+            alloc_sizes: std::collections::HashMap::new(),
+            sem_counter: 0,
+        };
+
+        for (i, imp) in imports.iter().enumerate() {
+            // Write J HLE_BASE+i*4; NOP at each import address
+            let hle_addr = HLE_BASE + (i as u32) * 4;
+            let j_insn = (0x02u32 << 26) | ((hle_addr >> 2) & 0x03FF_FFFF);
+            mem.write_u32(imp.target_vaddr, j_insn);
+            mem.write_u32(imp.target_vaddr + 4, 0); // NOP delay slot
+
+            let handler: HleFn = match imp.name.as_str() {
+                "malloc" => hle_malloc,
+                "free" => hle_free,
+                "realloc" => hle_realloc,
+                "printf" => hle_printf,
+                "sprintf" => hle_sprintf,
+                "fprintf" => hle_fprintf,
+                "strlen" => hle_strlen,
+                "strncasecmp" => hle_strncasecmp,
+                "abort" => hle_abort,
+                "_lcd_get_frame" | "lcd_get_cframe" => hle_lcd_get_frame,
+                "OSSemCreate" => hle_ossem_create,
+                "OSTimeGet" | "GetTickCount" => hle_get_tick,
+                "vxGoHome" => hle_exit,
+                _ => hle_default,
+            };
+
+            state.handlers.push(handler);
+            state.names.push(imp.name.clone());
+        }
+
+        eprintln!("[HLE] Patched {} imports with J → HLE_BASE(0x{:08x})", imports.len(), HLE_BASE);
+        state
+    }
+
+    pub fn is_hle_addr(&self, pc: u32) -> Option<usize> {
+        if pc >= HLE_BASE && pc < HLE_BASE + (self.handlers.len() as u32) * 4 {
+            Some(((pc - HLE_BASE) / 4) as usize)
+        } else {
+            None
+        }
+    }
+
+    pub fn dispatch(&mut self, idx: usize, cpu: &mut Cpu, mem: &mut Memory) {
+        let name = &self.names[idx];
+        eprintln!(
+            "[HLE] [{:08}] {}(0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x})  $ra=0x{:08x}",
+            cpu.insn_count, name,
+            cpu.gpr(4), cpu.gpr(5), cpu.gpr(6), cpu.gpr(7), cpu.gpr(31),
+        );
+
+        let func = self.handlers[idx];
+        func(cpu, mem, self);
+
+        eprintln!(
+            "[HLE]   -> $v0=0x{:08x}  $v1=0x{:08x}",
+            cpu.gpr(2), cpu.gpr(3),
+        );
+
+        cpu.pc = cpu.gpr(31);
+        cpu.next_pc = cpu.pc.wrapping_add(4);
+    }
+
+    pub fn name(&self, idx: usize) -> &str {
+        &self.names[idx]
+    }
+}
+
+// ── HLE Handlers ───────────────────────────────────────────────────────────────
+
+fn hle_malloc(cpu: &mut Cpu, _mem: &mut Memory, state: &mut HleState) {
+    let size = cpu.gpr(4);
+    let aligned = (state.heap_ptr + 7) & !7;
+    state.alloc_sizes.insert(aligned, size);
+    state.heap_ptr = aligned + size;
+    cpu.set_gpr(2, aligned);
+}
+
+fn hle_free(_cpu: &mut Cpu, _mem: &mut Memory, _state: &mut HleState) {}
+
+fn hle_realloc(cpu: &mut Cpu, mem: &mut Memory, state: &mut HleState) {
+    let old_ptr = cpu.gpr(4);
+    let new_size = cpu.gpr(5);
+    let aligned = (state.heap_ptr + 7) & !7;
+    state.heap_ptr = aligned + new_size;
+    if old_ptr != 0 {
+        if let Some(&old_size) = state.alloc_sizes.get(&old_ptr) {
+            let copy_size = old_size.min(new_size) as usize;
+            for i in 0..copy_size {
+                let b = mem.read_u8(old_ptr + i as u32);
+                mem.write_u8(aligned + i as u32, b);
+            }
+        }
+    }
+    state.alloc_sizes.insert(aligned, new_size);
+    cpu.set_gpr(2, aligned);
+}
+
+fn hle_printf(cpu: &mut Cpu, mem: &mut Memory, _state: &mut HleState) {
+    let fmt_addr = cpu.gpr(4);
+    let output = format_guest_string(mem, cpu, fmt_addr, 1);
+    print!("{}", output);
+    cpu.set_gpr(2, output.len() as u32);
+}
+
+fn hle_sprintf(cpu: &mut Cpu, mem: &mut Memory, _state: &mut HleState) {
+    let buf_addr = cpu.gpr(4);
+    let fmt_addr = cpu.gpr(5);
+    let output = format_guest_string(mem, cpu, fmt_addr, 2);
+    for (i, b) in output.bytes().enumerate() {
+        mem.write_u8(buf_addr + i as u32, b);
+    }
+    mem.write_u8(buf_addr + output.len() as u32, 0);
+    cpu.set_gpr(2, output.len() as u32);
+}
+
+fn hle_fprintf(cpu: &mut Cpu, mem: &mut Memory, _state: &mut HleState) {
+    let fmt_addr = cpu.gpr(5);
+    if fmt_addr < 0x8000_0000 || fmt_addr >= 0xA000_0000 {
+        eprintln!("[HLE] fprintf: bad fmt addr 0x{fmt_addr:08x}, skipping");
+        cpu.set_gpr(2, 0);
+        return;
+    }
+    let output = format_guest_string(mem, cpu, fmt_addr, 2);
+    print!("{}", output);
+    cpu.set_gpr(2, output.len() as u32);
+}
+
+fn hle_strlen(cpu: &mut Cpu, mem: &mut Memory, _state: &mut HleState) {
+    let s = cpu.gpr(4);
+    let len = mem.read_string(s).len();
+    cpu.set_gpr(2, len as u32);
+}
+
+fn hle_strncasecmp(cpu: &mut Cpu, mem: &mut Memory, _state: &mut HleState) {
+    let a_addr = cpu.gpr(4);
+    let b_addr = cpu.gpr(5);
+    let n = cpu.gpr(6) as usize;
+    let a = mem.read_string(a_addr);
+    let b = mem.read_string(b_addr);
+    let a_bytes: Vec<u8> = a.bytes().take(n).map(|c| c.to_ascii_lowercase()).collect();
+    let b_bytes: Vec<u8> = b.bytes().take(n).map(|c| c.to_ascii_lowercase()).collect();
+    let result = a_bytes.cmp(&b_bytes) as i32;
+    cpu.set_gpr(2, result as u32);
+}
+
+fn hle_abort(_cpu: &mut Cpu, _mem: &mut Memory, _state: &mut HleState) {
+    eprintln!("[HLE] abort() called");
+    std::process::exit(1);
+}
+
+fn hle_default(cpu: &mut Cpu, _mem: &mut Memory, _state: &mut HleState) {
+    cpu.set_gpr(2, 0);
+}
+
+fn hle_lcd_get_frame(cpu: &mut Cpu, _mem: &mut Memory, _state: &mut HleState) {
+    cpu.set_gpr(2, LCD_FRAMEBUF);
+}
+
+fn hle_ossem_create(cpu: &mut Cpu, _mem: &mut Memory, state: &mut HleState) {
+    state.sem_counter += 1;
+    cpu.set_gpr(2, 0x80E0_0000 + state.sem_counter * 4);
+}
+
+fn hle_get_tick(cpu: &mut Cpu, _mem: &mut Memory, _state: &mut HleState) {
+    cpu.set_gpr(2, (cpu.insn_count / 336) as u32);
+}
+
+fn hle_exit(_cpu: &mut Cpu, _mem: &mut Memory, _state: &mut HleState) {
+    eprintln!("[HLE] vxGoHome() — exiting");
+    std::process::exit(0);
+}
+
+// ── printf format engine ───────────────────────────────────────────────────────
+
+fn read_vararg(cpu: &Cpu, mem: &Memory, arg_index: usize) -> u32 {
+    match arg_index {
+        0 => cpu.gpr(4),
+        1 => cpu.gpr(5),
+        2 => cpu.gpr(6),
+        3 => cpu.gpr(7),
+        _ => {
+            let sp = cpu.gpr(29);
+            mem.read_u32(sp + 16 + ((arg_index - 4) as u32) * 4)
+        }
+    }
+}
+
+fn format_guest_string(mem: &Memory, cpu: &Cpu, fmt_addr: u32, first_arg: usize) -> String {
+    let fmt = mem.read_string(fmt_addr);
+    let mut result = String::new();
+    let mut arg_idx = first_arg;
+    let mut chars = fmt.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            result.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('%') => { chars.next(); result.push('%'); }
+            _ => {
+                while matches!(chars.peek(), Some('-' | '+' | ' ' | '0' | '#')) { chars.next(); }
+                while matches!(chars.peek(), Some('0'..='9')) { chars.next(); }
+                if matches!(chars.peek(), Some('.')) {
+                    chars.next();
+                    while matches!(chars.peek(), Some('0'..='9')) { chars.next(); }
+                }
+                while matches!(chars.peek(), Some('l' | 'h' | 'z')) { chars.next(); }
+
+                let val = read_vararg(cpu, mem, arg_idx);
+                arg_idx += 1;
+
+                match chars.next() {
+                    Some('d' | 'i') => result.push_str(&format!("{}", val as i32)),
+                    Some('u') => result.push_str(&format!("{}", val)),
+                    Some('x') => result.push_str(&format!("{:x}", val)),
+                    Some('X') => result.push_str(&format!("{:X}", val)),
+                    Some('o') => result.push_str(&format!("{:o}", val)),
+                    Some('c') => result.push(char::from(val as u8)),
+                    Some('s') => result.push_str(&mem.read_string(val)),
+                    Some('p') => result.push_str(&format!("0x{:08x}", val)),
+                    Some(other) => { result.push('%'); result.push(other); }
+                    None => result.push('%'),
+                }
+            }
+        }
+    }
+    result
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────────
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -47,22 +303,26 @@ fn main() {
         .map(|e| e.vaddr)
         .unwrap_or(ccdl.load_vaddr);
 
-    let mut hle_state = HleState::new(
-        &ccdl.imports,
-        &mut mem,
-        ccdl.load_vaddr,
-        ccdl.data_size,
-    );
+    let code_start = ccdl.load_vaddr;
+    let code_end = ccdl.load_vaddr + ccdl.data_size;
+
+    let mut hle = HleState::new(&ccdl.imports, &mut mem);
 
     let mut cpu = Cpu::new();
     cpu.pc = entry;
     cpu.next_pc = entry.wrapping_add(4);
-    cpu.set_gpr(29, DEFAULT_SP); // $sp
-    cpu.set_gpr(31, SENTINEL_RA); // $ra
-    // AppMain args: $a0=0, $a1=0 (normal entry, no special flags)
+    cpu.set_gpr(29, DEFAULT_SP);
+    cpu.set_gpr(31, SENTINEL_RA);
+    cpu.code_start = code_start;
+    cpu.code_end = code_end;
 
     eprintln!("Entry: 0x{entry:08x}, $sp=0x{DEFAULT_SP:08x}");
+    eprintln!("Text:  [0x{code_start:08x}, 0x{code_end:08x})");
     eprintln!("Running...\n");
+
+    let mut pc_history: Vec<u32> = Vec::new();
+    let mut last_hle_name = String::new();
+    let mut hle_repeat_count = 0u32;
 
     loop {
         if cpu.insn_count >= max_insns {
@@ -70,99 +330,133 @@ fn main() {
             break;
         }
 
-        let current_pc = cpu.pc;
-
-        if current_pc == SENTINEL_RA {
-            eprintln!("\n[STOP] AppMain returned (hit sentinel $ra)");
-            break;
-        }
-
-        if trace {
-            let insn = mem.read_u32(current_pc);
-            eprintln!("[{:08}] {:08x}: {:08x}", cpu.insn_count, current_pc, insn);
-        }
-
+        let pre_pc = cpu.pc;
         match cpu.step(&mut mem) {
-            StepResult::Ok => {}
+            StepResult::Ok => {
+                if trace {
+                    let insn = mem.read_u32(pre_pc);
+                    eprintln!("[{:08}] {:08x}: {:08x}", cpu.insn_count, pre_pc, insn);
+                }
+                pc_history.push(pre_pc);
+                if pc_history.len() > 16 {
+                    pc_history.remove(0);
+                }
+            }
+            StepResult::OutOfText => {
+                let pc = cpu.pc;
+
+                if pc == SENTINEL_RA {
+                    eprintln!("\n[STOP] AppMain returned (hit sentinel $ra)");
+                    break;
+                }
+
+                if let Some(idx) = hle.is_hle_addr(pc) {
+                    let name = hle.name(idx).to_string();
+                    if name == last_hle_name {
+                        hle_repeat_count += 1;
+                        if hle_repeat_count == 3 {
+                            eprintln!("[HLE] ... {} repeating (suppressing)", name);
+                        }
+                    } else {
+                        if hle_repeat_count > 3 {
+                            eprintln!("[HLE] ... {} repeated {} times total", last_hle_name, hle_repeat_count);
+                        }
+                        hle_repeat_count = 0;
+                        last_hle_name = name;
+                    }
+                    hle.dispatch(idx, &mut cpu, &mut mem);
+                } else {
+                    eprintln!("\n[FATAL] PC 0x{pc:08x} outside text segment [0x{code_start:08x}, 0x{code_end:08x})");
+                    break;
+                }
+            }
             StepResult::Break(code) => {
-                hle_state.dispatch(code, &mut cpu, &mut mem);
+                eprintln!("\n[FATAL] Unexpected BREAK code={code} at PC=0x{:08x}", cpu.pc);
+                break;
             }
         }
     }
+    if hle_repeat_count > 3 {
+        eprintln!("[HLE] ... {} repeated {} times total", last_hle_name, hle_repeat_count);
+    }
 
     eprintln!("\nTotal instructions: {}", cpu.insn_count);
+    eprintln!("\n=== CPU State ===");
+    eprintln!("  pc  = 0x{:08x}  hi = 0x{:08x}  lo = 0x{:08x}", cpu.pc, cpu.hi, cpu.lo);
+    let names = [
+        "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+        "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
+    ];
+    for row in 0..8 {
+        let i = row * 4;
+        eprintln!(
+            "  ${:4}=0x{:08x}  ${:4}=0x{:08x}  ${:4}=0x{:08x}  ${:4}=0x{:08x}",
+            names[i], cpu.gpr[i],
+            names[i+1], cpu.gpr[i+1],
+            names[i+2], cpu.gpr[i+2],
+            names[i+3], cpu.gpr[i+3],
+        );
+    }
+    eprintln!("\n=== Key Memory ===");
+    eprintln!("  data_80b3a2e0 (fb_ptr) = 0x{:08x}", mem.read_u32(0x80B3_A2E0));
+    eprintln!("  stack[$sp+0x10]        = 0x{:08x}", mem.read_u32(cpu.gpr[29].wrapping_add(0x10)));
 }
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod integration {
-    use crate::hle::HleState;
-    use crate::loader::{load_ccdl, parse_ccdl};
-    use crate::mem::Memory;
-    use crate::mips::{Cpu, StepResult};
+    use super::*;
+    use crate::loader::parse_ccdl;
     use std::path::Path;
-
-    const SENTINEL_RA: u32 = 0xDEAD_0000;
-    const DEFAULT_SP: u32 = 0x8001_0000;
 
     fn load_qiye() -> Vec<u8> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("qiye.app");
         std::fs::read(&path).expect("qiye.app not found — place it in project root")
     }
 
-    /// Set up CPU + Memory + HLE with qiye.app loaded, ready to run from AppMain.
-    fn setup_qiye() -> (Cpu, Memory, HleState, u32) {
+    fn setup_qiye() -> (Cpu, Memory, HleState, u32, u32) {
         let data = load_qiye();
         let mut mem = Memory::new();
         let ccdl = load_ccdl(&data, &mut mem);
-
-        let entry = ccdl
-            .exports
-            .iter()
-            .find(|e| e.name == "AppMain")
-            .map(|e| e.vaddr)
-            .expect("AppMain not found");
-
-        let hle_state = HleState::new(
-            &ccdl.imports,
-            &mut mem,
-            ccdl.load_vaddr,
-            ccdl.data_size,
-        );
-
+        let entry = ccdl.exports.iter().find(|e| e.name == "AppMain").map(|e| e.vaddr).expect("AppMain not found");
+        let code_start = ccdl.load_vaddr;
+        let code_end = ccdl.load_vaddr + ccdl.data_size;
+        let hle = HleState::new(&ccdl.imports, &mut mem);
         let mut cpu = Cpu::new();
         cpu.pc = entry;
         cpu.next_pc = entry.wrapping_add(4);
         cpu.set_gpr(29, DEFAULT_SP);
         cpu.set_gpr(31, SENTINEL_RA);
-
-        (cpu, mem, hle_state, entry)
+        cpu.code_start = code_start;
+        cpu.code_end = code_end;
+        (cpu, mem, hle, code_start, code_end)
     }
 
-    /// Run CPU until max_insns, sentinel hit, or BREAK (returns break code).
-    fn run_until(
-        cpu: &mut Cpu,
-        mem: &mut Memory,
-        hle: &mut HleState,
-        max_insns: u64,
-        handle_breaks: bool,
-    ) -> Option<u32> {
+    /// Run until HLE call or limit. Returns Some(hle_index) on first HLE call
+    /// when handle_hle=false, or None on limit/sentinel.
+    fn run_until(cpu: &mut Cpu, mem: &mut Memory, hle: &mut HleState, max_insns: u64, handle_hle: bool) -> Option<usize> {
         let start = cpu.insn_count;
         loop {
-            if cpu.insn_count - start >= max_insns {
-                return None;
-            }
-            if cpu.pc == SENTINEL_RA {
-                return None;
-            }
+            if cpu.insn_count - start >= max_insns { return None; }
             match cpu.step(mem) {
                 StepResult::Ok => {}
-                StepResult::Break(code) => {
-                    if handle_breaks {
-                        hle.dispatch(code, cpu, mem);
+                StepResult::OutOfText => {
+                    let pc = cpu.pc;
+                    if pc == SENTINEL_RA { return None; }
+                    if let Some(idx) = hle.is_hle_addr(pc) {
+                        if handle_hle {
+                            hle.dispatch(idx, cpu, mem);
+                        } else {
+                            return Some(idx);
+                        }
                     } else {
-                        return Some(code);
+                        panic!("PC 0x{pc:08x} outside text [0x{:08x}, 0x{:08x})", cpu.code_start, cpu.code_end);
                     }
                 }
+                StepResult::Break(code) => panic!("Unexpected BREAK code={code}"),
             }
         }
     }
@@ -181,15 +475,10 @@ mod integration {
         let data = load_qiye();
         let mut mem = Memory::new();
         let ccdl = load_ccdl(&data, &mut mem);
-
-        // First instruction at load_vaddr should be non-zero (loaded code)
         let first_insn = mem.read_u32(ccdl.load_vaddr);
-        assert_ne!(first_insn, 0, "Code should be loaded at load_vaddr");
-
-        // Verify AppMain's first instruction: addiu $a0, $a0, 4
-        // opcode=0x09, rs=4, rt=4, imm=4 → 0x24840004
+        assert_ne!(first_insn, 0);
         let appmain_insn = mem.read_u32(0x80A0_01A4);
-        assert_eq!(appmain_insn, 0x2484_0004, "AppMain should start with addiu $a0, $a0, 4");
+        assert_eq!(appmain_insn, 0x2484_0004);
     }
 
     #[test]
@@ -197,243 +486,116 @@ mod integration {
         let data = load_qiye();
         let mut mem = Memory::new();
         let ccdl = load_ccdl(&data, &mut mem);
-
-        // BSS region: from load_vaddr + data_size to load_vaddr + memory_size
         let bss_start = ccdl.load_vaddr + ccdl.data_size;
         let bss_end = ccdl.base_addr + ccdl.memory_size;
-
-        // Sample BSS locations — should all be zero
         for addr in [bss_start, bss_start + 0x100, bss_end - 4] {
-            assert_eq!(
-                mem.read_u32(addr), 0,
-                "BSS at 0x{addr:08x} should be zero"
-            );
+            assert_eq!(mem.read_u32(addr), 0, "BSS at 0x{addr:08x} should be zero");
         }
     }
 
     #[test]
-    fn test_trampoline_break_instructions() {
-        let (_, mem, _, _) = setup_qiye();
-
-        // Trampolines at 0x80C00000, 8 bytes each, contain BREAK instructions
-        let tramp_base = 0x80C0_0000u32;
-
-        // Check first few trampolines have valid BREAK instructions
-        for i in 0..5u32 {
-            let insn = mem.read_u32(tramp_base + i * 8);
-            let funct = insn & 0x3F;
-            let code = (insn >> 6) & 0xF_FFFF;
-            assert_eq!(funct, 0x0D, "Trampoline {i} should be BREAK");
-            assert_eq!(code, i, "Trampoline {i} BREAK code should be {i}");
-
-            // Second word should be NOP
-            let nop = mem.read_u32(tramp_base + i * 8 + 4);
-            assert_eq!(nop, 0, "Trampoline {i} delay slot should be NOP");
-        }
-    }
-
-    #[test]
-    fn test_jal_import_redirected_to_trampoline() {
-        let data = load_qiye();
-        let mut mem = Memory::new();
-        let ccdl = load_ccdl(&data, &mut mem);
-
-        // Before HLE patching, save the original malloc JAL target
-        // malloc's import entry target_vaddr
-        let malloc_import = ccdl.imports.iter().find(|i| i.name == "malloc");
-        assert!(malloc_import.is_some(), "malloc import should exist");
-
-        // Now set up HLE (which patches JAL/J instructions)
-        let _hle = HleState::new(
-            &ccdl.imports,
-            &mut mem,
-            ccdl.load_vaddr,
-            ccdl.data_size,
-        );
-
-        // The JAL at 0x80a00174 originally targeted malloc's import address.
-        // After patching, it should target the trampoline.
-        let jal_insn = mem.read_u32(0x80A0_0174);
-        let opcode = (jal_insn >> 26) & 0x3F;
-        assert_eq!(opcode, 0x03, "Should still be JAL");
-
-        let target26 = jal_insn & 0x03FF_FFFF;
-        let target = (0x80A0_0174 & 0xF000_0000) | (target26 << 2);
-        // Target should be in trampoline range
-        assert!(
-            target >= 0x80C0_0000,
-            "JAL target 0x{target:08x} should be in trampoline range"
-        );
+    fn test_import_j_stubs_target_hle() {
+        let (_, mem, _, _, _) = setup_qiye();
+        // Import addresses should have J instructions targeting HLE_BASE range
+        let insn = mem.read_u32(0x80A0_01E8); // fprintf
+        let opcode = (insn >> 26) & 0x3F;
+        assert_eq!(opcode, 0x02, "Import addr should have J stub, got 0x{insn:08x}");
+        let target = (0x80A0_01E8 & 0xF000_0000) | ((insn & 0x03FF_FFFF) << 2);
+        assert!(target >= HLE_BASE && target < HLE_BASE + 0x1000,
+            "J target 0x{target:08x} should be in HLE range");
     }
 
     #[test]
     fn test_first_hle_call_is_malloc() {
-        let (mut cpu, mut mem, mut hle, _) = setup_qiye();
-
-        // Run until first BREAK (don't handle it)
-        let code = run_until(&mut cpu, &mut mem, &mut hle, 100_000, false);
-        assert!(code.is_some(), "Should hit a BREAK within 100k instructions");
-
-        let idx = code.unwrap() as usize;
-        let name = hle.name(idx as u32);
-        assert_eq!(name, "malloc", "First HLE call should be malloc");
-
-        // $a0 should be the malloc size = 0x25800
-        assert_eq!(cpu.gpr(4), 0x25800, "malloc size should be 0x25800 (framebuffer)");
+        let (mut cpu, mut mem, mut hle, _, _) = setup_qiye();
+        let idx = run_until(&mut cpu, &mut mem, &mut hle, 100_000, false);
+        assert!(idx.is_some());
+        assert_eq!(hle.name(idx.unwrap()), "malloc");
+        assert_eq!(cpu.gpr(4), 0x25800);
     }
 
     #[test]
     fn test_bss_region_zeroed_by_cpu() {
-        let (mut cpu, mut mem, mut hle, _) = setup_qiye();
-
-        // The init code in sub_80a00144 zeroes 0x80b3a2e0..0x80b44880
-        // This happens before the first HLE call (malloc).
-        // Run until first BREAK to let the BSS zeroing complete.
-        let _code = run_until(&mut cpu, &mut mem, &mut hle, 100_000, false);
-
-        // The init loop zeroes from data_80b3a2e0 to 0x80b44880
+        let (mut cpu, mut mem, mut hle, _, _) = setup_qiye();
+        let _idx = run_until(&mut cpu, &mut mem, &mut hle, 100_000, false);
         let bss_cpu_start = 0x80B3_A2E0u32;
         let bss_cpu_end = 0x80B4_4880u32;
-
-        // Sample addresses throughout the zeroed range
         for offset in [0, 0x100, 0x1000, 0x5000, 0xA59C] {
             let addr = bss_cpu_start + offset;
             if addr < bss_cpu_end {
-                assert_eq!(
-                    mem.read_u32(addr), 0,
-                    "CPU-zeroed BSS at 0x{addr:08x} should be 0"
-                );
+                assert_eq!(mem.read_u32(addr), 0);
             }
         }
     }
 
     #[test]
     fn test_malloc_returns_heap_address() {
-        let (mut cpu, mut mem, mut hle, _) = setup_qiye();
-
-        // Run until first BREAK and handle it (malloc)
+        let (mut cpu, mut mem, mut hle, _, _) = setup_qiye();
         run_until(&mut cpu, &mut mem, &mut hle, 100_000, true);
-
-        // After malloc, result stored at data_80b3a2e0 (0x80B3A2E0)
         let fb_ptr = mem.read_u32(0x80B3_A2E0);
-        assert!(
-            fb_ptr >= 0x9800_0000 && fb_ptr < 0xA000_0000,
-            "malloc result 0x{fb_ptr:08x} should be in heap range"
-        );
+        assert!(fb_ptr >= 0x9800_0000 && fb_ptr < 0xA000_0000);
     }
 
     #[test]
     fn test_framebuffer_zeroed_after_malloc() {
-        let (mut cpu, mut mem, mut hle, _) = setup_qiye();
-
-        // Run enough instructions to complete:
-        // 1. BSS zeroing (~42k insns)
-        // 2. malloc call (~1 insn)
-        // 3. Framebuffer zeroing loop (~153k insns)
-        // Total ~200k, use 250k to be safe
+        let (mut cpu, mut mem, mut hle, _, _) = setup_qiye();
         run_until(&mut cpu, &mut mem, &mut hle, 250_000, true);
-
-        // The framebuffer pointer was stored at 0x80B3A2E0 by malloc
         let fb_ptr = mem.read_u32(0x80B3_A2E0);
         if fb_ptr >= 0x9800_0000 && fb_ptr < 0xA000_0000 {
-            // Framebuffer (0x25800 bytes) should be zeroed
             for offset in [0u32, 4, 0x100, 0x12C00, 0x257FC] {
-                assert_eq!(
-                    mem.read_u32(fb_ptr + offset), 0,
-                    "Framebuffer at +0x{offset:x} should be zeroed"
-                );
+                assert_eq!(mem.read_u32(fb_ptr + offset), 0);
             }
         }
     }
 
     #[test]
     fn test_stack_frame_saved() {
-        let (mut cpu, mut mem, mut hle, _) = setup_qiye();
-
-        // sub_80a00144 saves $ra at $sp+0x10 in its delay slot
-        // Run a few instructions to get past that point
+        let (mut cpu, mut mem, mut hle, _, _) = setup_qiye();
         for _ in 0..10 {
             match cpu.step(&mut mem) {
                 StepResult::Ok => {}
-                StepResult::Break(code) => {
-                    hle.dispatch(code, &mut cpu, &mut mem);
+                StepResult::OutOfText => {
+                    if let Some(idx) = hle.is_hle_addr(cpu.pc) {
+                        hle.dispatch(idx, &mut cpu, &mut mem);
+                    }
                 }
+                StepResult::Break(_) => {}
             }
         }
-
-        // $ra was saved to stack: $sp + 0x10 = 0x80010010
         let saved_ra = mem.read_u32(DEFAULT_SP + 0x10);
-        assert_eq!(
-            saved_ra, SENTINEL_RA,
-            "Saved $ra on stack should be sentinel 0x{SENTINEL_RA:08x}, got 0x{saved_ra:08x}"
-        );
+        assert_eq!(saved_ra, SENTINEL_RA);
     }
 
     #[test]
     fn test_init_sequence_reaches_second_entry() {
-        let (mut cpu, mut mem, mut hle, _) = setup_qiye();
-
-        // Run through full init: BSS zero + malloc + framebuffer zero + re-entry
-        // After framebuffer zeroing, code jumps back to sub_80a00144 with $a1=0x257ff
-        // sub_80a00144 takes $a1!=0 path, then $a1!=1 path → falls to 0x80a001e4
-        // Total should be ~200k instructions
-        let mut break_names = Vec::new();
+        let (mut cpu, mut mem, mut hle, _, _) = setup_qiye();
+        let mut hle_names = Vec::new();
         let start = cpu.insn_count;
         loop {
-            if cpu.insn_count - start >= 250_000 {
-                break;
-            }
-            if cpu.pc == SENTINEL_RA {
-                break;
-            }
+            if cpu.insn_count - start >= 250_000 { break; }
             match cpu.step(&mut mem) {
                 StepResult::Ok => {}
-                StepResult::Break(code) => {
-                    break_names.push(hle.name(code).to_string());
-                    hle.dispatch(code, &mut cpu, &mut mem);
+                StepResult::OutOfText => {
+                    let pc = cpu.pc;
+                    if pc == SENTINEL_RA { break; }
+                    if let Some(idx) = hle.is_hle_addr(pc) {
+                        hle_names.push(hle.name(idx).to_string());
+                        hle.dispatch(idx, &mut cpu, &mut mem);
+                    } else {
+                        panic!("PC 0x{pc:08x} outside text");
+                    }
                 }
+                StepResult::Break(_) => panic!("Unexpected BREAK"),
             }
         }
-
-        // Should have called malloc as the first (and likely only) HLE call in init
-        assert!(!break_names.is_empty(), "Should have HLE calls during init");
-        assert_eq!(break_names[0], "malloc", "First HLE call should be malloc");
+        assert!(!hle_names.is_empty());
+        assert_eq!(hle_names[0], "malloc");
     }
 
     #[test]
     fn test_insn_count_reasonable() {
-        let (mut cpu, mut mem, mut hle, _) = setup_qiye();
-
-        // Run until first BREAK
+        let (mut cpu, mut mem, mut hle, _, _) = setup_qiye();
         run_until(&mut cpu, &mut mem, &mut hle, 100_000, false);
-
-        // BSS zeroing: ~42k instructions (14 setup + 10600 iterations × 4 insns)
-        // Should be in that ballpark
-        assert!(
-            cpu.insn_count > 40_000 && cpu.insn_count < 50_000,
-            "Expected ~42k insns before malloc, got {}",
-            cpu.insn_count,
-        );
-    }
-
-    #[test]
-    fn test_import_addresses_have_j_stubs() {
-        let (_, mem, _, _) = setup_qiye();
-
-        // Like the real CCDL OS loader, import addresses have J-to-trampoline stubs.
-        // CRT code falls through into import slots expecting jump stubs.
-
-        // fprintf import at 0x80A001E8 — should be a J instruction to its trampoline
-        let insn_at_fprintf = mem.read_u32(0x80A0_01E8);
-        let opcode = (insn_at_fprintf >> 26) & 0x3F;
-        assert_eq!(opcode, 0x02, "Import address should have J stub");
-
-        // Delay slot should be NOP
-        let delay = mem.read_u32(0x80A0_01EC);
-        assert_eq!(delay, 0, "Import J stub delay slot should be NOP");
-
-        // J target should be in trampoline range
-        let target = (0x80A0_01E8 & 0xF000_0000) | ((insn_at_fprintf & 0x03FF_FFFF) << 2);
-        assert!(target >= 0x80C0_0000, "J target should be in trampoline range");
+        assert!(cpu.insn_count > 40_000 && cpu.insn_count < 50_000, "got {}", cpu.insn_count);
     }
 }

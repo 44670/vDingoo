@@ -3,6 +3,7 @@ use crate::mem::Memory;
 pub enum StepResult {
     Ok,
     Break(u32),
+    OutOfText,
 }
 
 pub struct Cpu {
@@ -12,6 +13,8 @@ pub struct Cpu {
     pub hi: u32,
     pub lo: u32,
     pub insn_count: u64,
+    pub code_start: u32,
+    pub code_end: u32,
 }
 
 impl Cpu {
@@ -23,6 +26,8 @@ impl Cpu {
             hi: 0,
             lo: 0,
             insn_count: 0,
+            code_start: 0,
+            code_end: 0,
         }
     }
 
@@ -38,6 +43,12 @@ impl Cpu {
 
     pub fn step(&mut self, mem: &mut Memory) -> StepResult {
         let current_pc = self.pc;
+
+        // Fast path: PC in code region
+        if current_pc < self.code_start || current_pc >= self.code_end {
+            return StepResult::OutOfText;
+        }
+
         self.pc = self.next_pc;
         self.next_pc = self.pc.wrapping_add(4);
         self.insn_count += 1;
@@ -558,6 +569,8 @@ mod tests {
         let mem = Memory::new();
         cpu.pc = 0x80A0_0000;
         cpu.next_pc = cpu.pc.wrapping_add(4);
+        cpu.code_start = 0x80A0_0000;
+        cpu.code_end = 0x80C0_0000;
         (cpu, mem)
     }
 
@@ -935,8 +948,21 @@ mod tests {
         write_insn(&mut mem, 0x80A0_0000, insn_break(5));
         match cpu.step(&mut mem) {
             StepResult::Break(code) => assert_eq!(code, 5),
-            StepResult::Ok => panic!("Expected Break"),
+            _ => panic!("Expected Break"),
         }
+    }
+
+    #[test]
+    fn test_out_of_text() {
+        let (mut cpu, mut mem) = make_cpu_mem();
+        cpu.pc = 0x8000_0000;
+        cpu.next_pc = 0x8000_0004;
+        match cpu.step(&mut mem) {
+            StepResult::OutOfText => {}
+            _ => panic!("Expected OutOfText"),
+        }
+        assert_eq!(cpu.pc, 0x8000_0000);
+        assert_eq!(cpu.insn_count, 0);
     }
 
     // ---- ALU register ops ----
