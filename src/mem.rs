@@ -24,17 +24,20 @@ impl Memory {
 
     pub fn read_u16(&self, addr: u32) -> u16 {
         let off = self.offset(addr);
-        u16::from_le_bytes([self.data[off], self.data[off + 1]])
+        // SAFETY: offset() guarantees off < SIZE, and SIZE has room for +1
+        unsafe {
+            let ptr = self.data.as_ptr().add(off) as *const u16;
+            ptr.read_unaligned()
+        }
     }
 
     pub fn read_u32(&self, addr: u32) -> u32 {
         let off = self.offset(addr);
-        u32::from_le_bytes([
-            self.data[off],
-            self.data[off + 1],
-            self.data[off + 2],
-            self.data[off + 3],
-        ])
+        // SAFETY: offset() guarantees off < SIZE, and SIZE has room for +3
+        unsafe {
+            let ptr = self.data.as_ptr().add(off) as *const u32;
+            ptr.read_unaligned()
+        }
     }
 
     pub fn write_u8(&mut self, addr: u32, val: u8) {
@@ -44,18 +47,18 @@ impl Memory {
 
     pub fn write_u16(&mut self, addr: u32, val: u16) {
         let off = self.offset(addr);
-        let bytes = val.to_le_bytes();
-        self.data[off] = bytes[0];
-        self.data[off + 1] = bytes[1];
+        unsafe {
+            let ptr = self.data.as_mut_ptr().add(off) as *mut u16;
+            ptr.write_unaligned(val);
+        }
     }
 
     pub fn write_u32(&mut self, addr: u32, val: u32) {
         let off = self.offset(addr);
-        let bytes = val.to_le_bytes();
-        self.data[off] = bytes[0];
-        self.data[off + 1] = bytes[1];
-        self.data[off + 2] = bytes[2];
-        self.data[off + 3] = bytes[3];
+        unsafe {
+            let ptr = self.data.as_mut_ptr().add(off) as *mut u32;
+            ptr.write_unaligned(val);
+        }
     }
 
     pub fn read_string(&self, addr: u32) -> String {

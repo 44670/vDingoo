@@ -20,17 +20,19 @@ const LCD_FRAMEBUF: u32 = 0x80F0_0000;
 const LCD_W: u32 = 320;
 const LCD_H: u32 = 240;
 
-// Dingoo key bits (GPIO-based, verified via input_dispatch + InputMapping RE)
-// D-pad: derived from InputMapping_setDefaults alt keys → engine keys → GPIO bits
-const KEY_UP: u32 = 0x0010_0000; // bit 20 → key 0x0f → action 1 (forward)
-const KEY_DOWN: u32 = 0x0800_0000; // bit 27 → key 0x10 → action 2 (backward)
-const KEY_LEFT: u32 = 0x1000_0000; // bit 28 → key 0x0d → action 3 (left)
-const KEY_RIGHT: u32 = 0x0004_0000; // bit 18 → key 0x0e → action 4 (right)
-// Face/system: derived from TitleScreen_update InputSlot_isPressed checks
-const KEY_A: u32 = 0x8000_0000; // bit 31 → key 0x08 (confirm/action)
-const KEY_B: u32 = 0x0020_0000; // bit 21 → key 0x12 (cancel/menu)
-const KEY_START: u32 = 0x0001_0000; // bit 16 → key 0x11
-const KEY_SELECT: u32 = 0x0000_0040; // bit 6  → key 0x02
+// Dingoo A320 key bits (GPIO bitmask from _kbd_get_status)
+const KEY_UP: u32 = 0x0010_0000;
+const KEY_DOWN: u32 = 0x0800_0000;
+const KEY_LEFT: u32 = 0x1000_0000;
+const KEY_RIGHT: u32 = 0x0004_0000;
+const KEY_A: u32 = 0x8000_0000;
+const KEY_B: u32 = 0x0020_0000;
+const KEY_X: u32 = 0x0001_0000;
+const KEY_Y: u32 = 0x0000_0040;
+const KEY_LS: u32 = 0x0000_0100;
+const KEY_RS: u32 = 0x2000_0000;
+const KEY_SELECT: u32 = 0x0000_0400;
+const KEY_START: u32 = 0x0000_0800;
 
 // ── HLE Dispatch Table ──────────────────────────────────────────────────────
 
@@ -507,14 +509,22 @@ fn poll_sdl_input(ctx: &mut EmuCtx) {
     // Read keyboard state
     let keys = ctx.sdl.event_pump.keyboard_state();
     let mut btns = 0u32;
+    // D-pad: arrow keys
     if keys.is_scancode_pressed(Scancode::Up) { btns |= KEY_UP; }
     if keys.is_scancode_pressed(Scancode::Down) { btns |= KEY_DOWN; }
     if keys.is_scancode_pressed(Scancode::Left) { btns |= KEY_LEFT; }
     if keys.is_scancode_pressed(Scancode::Right) { btns |= KEY_RIGHT; }
-    if keys.is_scancode_pressed(Scancode::Z) { btns |= KEY_A; }
-    if keys.is_scancode_pressed(Scancode::X) { btns |= KEY_B; }
-    if keys.is_scancode_pressed(Scancode::C) { btns |= KEY_SELECT; }
-    if keys.is_scancode_pressed(Scancode::Return) { btns |= KEY_START; }
+    // Face buttons (PPSSPP-style layout)
+    if keys.is_scancode_pressed(Scancode::X) { btns |= KEY_A; }  // Circle = A (confirm)
+    if keys.is_scancode_pressed(Scancode::Z) { btns |= KEY_B; }  // Cross = B (cancel)
+    if keys.is_scancode_pressed(Scancode::S) { btns |= KEY_X; }  // Triangle = X
+    if keys.is_scancode_pressed(Scancode::A) { btns |= KEY_Y; }  // Square = Y
+    // Shoulders
+    if keys.is_scancode_pressed(Scancode::Q) { btns |= KEY_LS; }
+    if keys.is_scancode_pressed(Scancode::W) { btns |= KEY_RS; }
+    // System
+    if keys.is_scancode_pressed(Scancode::V) { btns |= KEY_SELECT; }
+    if keys.is_scancode_pressed(Scancode::Space) { btns |= KEY_START; }
     ctx.hle.buttons = btns;
 }
 

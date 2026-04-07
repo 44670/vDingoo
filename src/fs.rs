@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub struct GuestFs {
     files: HashMap<u32, GuestFile>,
     next_fd: u32,
-    pub base_dir: PathBuf,
+    pub base_dir: PathBuf,  // nand/ directory — all file I/O is confined here
 }
 
 struct GuestFile {
@@ -57,7 +57,16 @@ impl GuestFs {
             p = p[2..].to_string();
         }
 
-        // Resolve relative to base_dir
+        // Strip leading "/"
+        if p.starts_with('/') {
+            p = p[1..].to_string();
+        }
+
+        // Prevent path traversal — reject any ".." component
+        if p.split('/').any(|c| c == "..") {
+            eprintln!("[FS] BLOCKED path traversal: {:?}", guest_path);
+            return self.base_dir.join("__blocked__");
+        }
         self.base_dir.join(&p)
     }
 

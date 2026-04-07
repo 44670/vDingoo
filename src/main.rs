@@ -44,7 +44,8 @@ fn main() {
 
     // Determine base directory (where the .app file lives)
     let app_abs = std::fs::canonicalize(app_path).unwrap_or_else(|_| PathBuf::from(app_path));
-    let base_dir = app_abs.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
+    let base_dir = app_abs.parent().unwrap_or_else(|| std::path::Path::new(".")).join("nand");
+    std::fs::create_dir_all(&base_dir).expect("Failed to create nand/ directory");
 
     let mut mem = Memory::new();
     let ccdl = load_ccdl(&data, &mut mem);
@@ -100,8 +101,11 @@ fn main() {
     eprintln!("=== Phase 2: AppMain(path) ===");
 
     // Write wide-string app path to scratch memory
-    // The game extracts the directory from this path, so give it the full path
-    let app_wpath = app_abs.to_string_lossy().replace('/', "\\");
+    // The game extracts the directory part (everything before last '\') as its working dir.
+    // We pass ".\qiye.app" so the game's working dir is "." — all file opens go through
+    // translate_path which strips ".\" and resolves relative to nand/.
+    let app_filename = app_abs.file_name().unwrap().to_string_lossy();
+    let app_wpath = format!("\\{}", app_filename);
     write_wstring(&mut mem, SCRATCH_ADDR, &app_wpath);
 
     // Reset CPU for AppMain call

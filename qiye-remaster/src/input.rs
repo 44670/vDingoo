@@ -72,17 +72,20 @@ impl InputState {
     }
 
     pub fn update_from_keyboard(&mut self, keys: &sdl2::keyboard::KeyboardState) {
-        self.set_action(Action::MoveForward, keys.is_scancode_pressed(Scancode::W));
-        self.set_action(Action::MoveBack, keys.is_scancode_pressed(Scancode::S));
-        self.set_action(Action::MoveLeft, keys.is_scancode_pressed(Scancode::A));
-        self.set_action(Action::MoveRight, keys.is_scancode_pressed(Scancode::D));
-        self.set_action(Action::MoveUp, keys.is_scancode_pressed(Scancode::Space));
-        self.set_action(Action::MoveDown, keys.is_scancode_pressed(Scancode::LShift));
-        self.set_action(Action::Sprint, keys.is_scancode_pressed(Scancode::LCtrl));
-        self.set_action(Action::Attack, keys.is_scancode_pressed(Scancode::F));
-        self.set_action(Action::Confirm, keys.is_scancode_pressed(Scancode::Return));
-        self.set_action(Action::Cancel, keys.is_scancode_pressed(Scancode::Backspace));
-        self.set_action(Action::MenuToggle, keys.is_scancode_pressed(Scancode::Tab));
+        // D-pad: arrow keys (matching KEYS.md SDL column)
+        self.set_action(Action::MoveForward, keys.is_scancode_pressed(Scancode::Up));
+        self.set_action(Action::MoveBack, keys.is_scancode_pressed(Scancode::Down));
+        self.set_action(Action::MoveLeft, keys.is_scancode_pressed(Scancode::Left));
+        self.set_action(Action::MoveRight, keys.is_scancode_pressed(Scancode::Right));
+        // Face buttons: A=X, B=Z, X=S, Y=A (matching KEYS.md SDL column)
+        self.set_action(Action::Attack, keys.is_scancode_pressed(Scancode::X));      // A (○)
+        self.set_action(Action::Confirm, keys.is_scancode_pressed(Scancode::Z));     // B (×)
+        self.set_action(Action::MenuToggle, keys.is_scancode_pressed(Scancode::S));  // X (△) map
+        self.set_action(Action::Cancel, keys.is_scancode_pressed(Scancode::A));      // Y (□)
+        // Shoulder/system
+        self.set_action(Action::MoveUp, keys.is_scancode_pressed(Scancode::Space));    // Start
+        self.set_action(Action::MoveDown, keys.is_scancode_pressed(Scancode::V));      // Select
+        self.set_action(Action::Sprint, keys.is_scancode_pressed(Scancode::Q));        // LS
         self.set_action(Action::NextMap, keys.is_scancode_pressed(Scancode::PageDown));
         self.set_action(Action::PrevMap, keys.is_scancode_pressed(Scancode::PageUp));
     }
