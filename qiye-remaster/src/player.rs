@@ -29,6 +29,7 @@
 ///   +0x9DC anim_enabled
 ///   +0x9E0 cutscene_active
 
+use crate::bsp::Bsp;
 use crate::input::{Action, InputState};
 use glam::Vec3;
 
@@ -164,7 +165,7 @@ impl Player {
         }
     }
 
-    pub fn update(&mut self, input: &InputState, camera_yaw: f32, dt: f32) {
+    pub fn update(&mut self, input: &InputState, camera_yaw: f32, dt: f32, bsp: Option<&Bsp>) {
         if self.dead || !self.active {
             return;
         }
@@ -200,24 +201,116 @@ impl Player {
             self.velocity.y -= self.gravity * dt;
         }
 
-        // Apply velocity
-        self.pos += self.velocity * dt;
-
         // Dead zone — original zeros velocity components below 0x28F (~0.01)
         if self.velocity.x.abs() < VEL_DEAD_ZONE { self.velocity.x = 0.0; }
         if self.velocity.z.abs() < VEL_DEAD_ZONE { self.velocity.z = 0.0; }
 
-        // Ground clamp (placeholder — needs BSP trace)
-        if self.pos.y < 0.0 {
-            self.pos.y = 0.0;
-            self.velocity.y = 0.0;
-            self.on_ground = true;
+        // Move with BSP collision (Quake-style moveAndSlide)
+        let move_delta = self.velocity * dt;
+        if let Some(bsp) = bsp {
+            self.move_and_slide(bsp, move_delta);
+        } else {
+            self.pos += move_delta;
+        }
+
+        // Ground trace — check if standing on something
+        if let Some(bsp) = bsp {
+            self.trace_ground(bsp);
         }
 
         // Friction (XZ only)
         let friction = 0.85_f32.powf(dt * 60.0);
         self.velocity.x *= friction;
         self.velocity.z *= friction;
+    }
+
+    /// Player AABB — relative mins/maxs. Original player is roughly human-sized.
+    const PLAYER_MINS: [f32; 3] = [-0.5, 0.0, -0.5];
+    const PLAYER_MAXS: [f32; 3] = [0.5, 2.5, 0.5];
+
+    /// Quake-style moveAndSlide: iteratively sweep and clip velocity against hit planes.
+    /// Up to 5 iterations (matches original PhysicsEntity_moveAndSlide).
+    fn move_and_slide(&mut self, bsp: &Bsp, mut move_delta: Vec3) {
+        let mut clip_planes: Vec<Vec3> = Vec::new();
+        let original_vel = move_delta;
+
+        for _iter in 0..5 {
+            if move_delta.length_squared() < 1e-8 {
+                break;
+            }
+
+            let start = [self.pos.x, self.pos.y, self.pos.z];
+            let end = [
+                self.pos.x + move_delta.x,
+                self.pos.y + move_delta.y,
+                self.pos.z + move_delta.z,
+            ];
+
+            let trace = bsp.trace_box(start, end, Self::PLAYER_MINS, Self::PLAYER_MAXS);
+
+            if trace.all_solid {
+                // Stuck — zero velocity and bail
+                self.velocity = Vec3::ZERO;
+                break;
+            }
+
+            // Move to the trace end position
+            self.pos = Vec3::new(trace.end_pos[0], trace.end_pos[1], trace.end_pos[2]);
+
+            if !trace.hit {
+                break; // no collision, done
+            }
+
+            // Reduce remaining movement by consumed fraction
+            let remaining = 1.0 - trace.fraction;
+            move_delta *= remaining;
+
+            // Record this clip plane
+            let normal = Vec3::new(trace.normal[0], trace.normal[1], trace.normal[2]);
+            clip_planes.push(normal);
+
+            // Clip velocity off all accumulated planes
+            for plane_n in &clip_planes {
+                let d = move_delta.dot(*plane_n);
+                if d < 0.0 {
+                    // Moving into plane — reflect off with small overbounce
+                    move_delta -= *plane_n * (d - 0.01);
+                }
+            }
+
+            // Also clip the stored velocity
+            let d = self.velocity.dot(normal);
+            if d < 0.0 {
+                self.velocity -= normal * d;
+            }
+
+            // Stop if reversed direction (ping-pong between walls)
+            if move_delta.dot(original_vel) <= 0.0 {
+                move_delta = Vec3::ZERO;
+                break;
+            }
+        }
+    }
+
+    /// Trace downward to detect ground contact (mirrors PhysicsEntity_traceGround).
+    fn trace_ground(&mut self, bsp: &Bsp) {
+        let ground_check_dist = 0.5;
+        let start = [self.pos.x, self.pos.y, self.pos.z];
+        let end = [self.pos.x, self.pos.y - ground_check_dist, self.pos.z];
+
+        let trace = bsp.trace_box(start, end, Self::PLAYER_MINS, Self::PLAYER_MAXS);
+
+        if trace.hit && trace.normal[1] > 0.7 {
+            // Standing on a surface with a mostly-upward normal
+            self.on_ground = true;
+            if self.velocity.y < 0.0 {
+                self.velocity.y = 0.0;
+            }
+            // Snap to ground
+            self.pos = Vec3::new(trace.end_pos[0], trace.end_pos[1], trace.end_pos[2]);
+        } else {
+            self.on_ground = false;
+        }
     }
 
     /// Process pending damage flags in priority order.

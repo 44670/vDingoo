@@ -437,7 +437,7 @@ pub fn run_npc(
         timer.update();
 
         // Player update (state machine, movement)
-        player.update(&input, camera.yaw, timer.dt);
+        player.update(&input, camera.yaw, timer.dt, None);
 
         // Camera follows player
         camera.update_orbit_target(player.pos + Vec3::new(0.0, extent.y * 0.4, 0.0));

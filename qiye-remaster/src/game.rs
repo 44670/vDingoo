@@ -18,6 +18,7 @@ use glam::{Mat4, Vec3};
 
 pub struct Game {
     fs: AppFs,
+    bsp: bsp::Bsp,  // stored for collision
     bsp_renderer: render::BspRenderer,
     debug_renderer: render::DebugRenderer,
     model_renderer: ModelRenderer,
@@ -42,7 +43,7 @@ pub struct Game {
 }
 
 impl Game {
-    pub fn new(fs: AppFs, bsp: &bsp::Bsp, bsp_path: &str, audio: AudioSystem) -> Self {
+    pub fn new(fs: AppFs, bsp: bsp::Bsp, bsp_path: &str, audio: AudioSystem) -> Self {
         // Build sorted list of all BSP files
         let mut bsp_files: Vec<String> = fs
             .list_files()
@@ -58,8 +59,8 @@ impl Game {
         let debug_renderer = render::DebugRenderer::new();
         let mut model_renderer = ModelRenderer::new();
 
-        let (bsp_renderer, entities, camera, scripts) =
-            Self::load_map_data(&fs, bsp, bsp_path, &mut model_renderer);
+        let (bsp_renderer, entities, mut camera, scripts) =
+            Self::load_map_data(&fs, &bsp, bsp_path, &mut model_renderer);
 
         Self::load_entity_models(&mut model_renderer, &entities, &fs);
 
@@ -75,8 +76,17 @@ impl Game {
         let ui_renderer = UiRenderer::new();
         let dialog = DialogBox::new();
 
+        // Default to 3rd person if we have a player
+        if let Some(ref p) = player {
+            camera.set_follow_mode(
+                p.pos + Vec3::new(0.0, 2.0, 0.0),
+                Vec3::new(0.0, 5.0, -10.0),
+            );
+        }
+
         Game {
             fs,
+            bsp,
             bsp_renderer,
             debug_renderer,
             model_renderer,
@@ -89,7 +99,7 @@ impl Game {
             game_data: GameData::new(),
             camera,
             player,
-            player_mode: false,
+            player_mode: true,
             timer: FrameTimer::new(),
             input: InputState::new(),
             scripts,
@@ -222,6 +232,7 @@ impl Game {
         Self::load_entity_models(&mut self.model_renderer, &entities, &self.fs);
 
         self.audio.stop_all();
+        self.bsp = bsp;
         self.bsp_renderer = bsp_renderer;
         self.entities = entities;
         self.triggers = TriggerSystem::new();
@@ -231,7 +242,7 @@ impl Game {
         self.camera = camera;
         self.scripts = scripts;
         self.first_mouse = true;
-        self.player_mode = false;
+        self.player_mode = true;
     }
 
     pub fn run(
@@ -280,7 +291,7 @@ impl Game {
             // Update player
             if self.player_mode {
                 if let Some(ref mut player) = self.player {
-                    player.update(&self.input, self.camera.yaw, self.timer.dt);
+                    player.update(&self.input, self.camera.yaw, self.timer.dt, Some(&self.bsp));
                     self.camera.update_follow_target(player.pos + Vec3::new(0.0, 2.0, 0.0));
                 }
             }

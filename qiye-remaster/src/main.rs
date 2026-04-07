@@ -149,7 +149,7 @@ fn main() {
             let sdl_audio = sdl.audio().unwrap();
             let audio_system = audio::AudioSystem::new(&sdl_audio);
 
-            let mut game = game::Game::new(fs, &bsp, &bsp_path, audio_system);
+            let mut game = game::Game::new(fs, bsp, &bsp_path, audio_system);
             game.run(&window, &mut event_pump);
         }
         "bsp" => {

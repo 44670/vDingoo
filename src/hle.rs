@@ -20,17 +20,17 @@ const LCD_FRAMEBUF: u32 = 0x80F0_0000;
 const LCD_W: u32 = 320;
 const LCD_H: u32 = 240;
 
-// Dingoo key bits
-const KEY_UP: u32 = 1 << 0;
-const KEY_DOWN: u32 = 1 << 1;
-const KEY_LEFT: u32 = 1 << 2;
-const KEY_RIGHT: u32 = 1 << 3;
-const KEY_A: u32 = 1 << 4;
-const KEY_B: u32 = 1 << 5;
-const KEY_SELECT: u32 = 1 << 6;
-const KEY_START: u32 = 1 << 7;
-const KEY_L: u32 = 1 << 8;
-const KEY_R: u32 = 1 << 9;
+// Dingoo key bits (GPIO-based, verified via input_dispatch + InputMapping RE)
+// D-pad: derived from InputMapping_setDefaults alt keys → engine keys → GPIO bits
+const KEY_UP: u32 = 0x0010_0000; // bit 20 → key 0x0f → action 1 (forward)
+const KEY_DOWN: u32 = 0x0800_0000; // bit 27 → key 0x10 → action 2 (backward)
+const KEY_LEFT: u32 = 0x1000_0000; // bit 28 → key 0x0d → action 3 (left)
+const KEY_RIGHT: u32 = 0x0004_0000; // bit 18 → key 0x0e → action 4 (right)
+// Face/system: derived from TitleScreen_update InputSlot_isPressed checks
+const KEY_A: u32 = 0x8000_0000; // bit 31 → key 0x08 (confirm/action)
+const KEY_B: u32 = 0x0020_0000; // bit 21 → key 0x12 (cancel/menu)
+const KEY_START: u32 = 0x0001_0000; // bit 16 → key 0x11
+const KEY_SELECT: u32 = 0x0000_0040; // bit 6  → key 0x02
 
 // ── HLE Dispatch Table ──────────────────────────────────────────────────────
 
@@ -44,7 +44,6 @@ pub struct HleState {
     sem_counter: u32,
     framebuf_addr: u32, // legacy, unused now
     pub buttons: u32,
-    pub buttons_prev: u32,
     pub quit: bool,
     start_time: Instant,
     suppress: HashMap<String, u32>,
@@ -76,7 +75,6 @@ impl HleState {
             sem_counter: 0,
             framebuf_addr: LCD_FRAMEBUF,
             buttons: 0,
-            buttons_prev: 0,
             quit: false,
             start_time: Instant::now(),
             suppress: HashMap::new(),
@@ -497,8 +495,6 @@ fn present_framebuffer(ctx: &mut EmuCtx) {
 // ── Input ───────────────────────────────────────────────────────────────────
 
 fn poll_sdl_input(ctx: &mut EmuCtx) {
-    ctx.hle.buttons_prev = ctx.hle.buttons;
-
     for event in ctx.sdl.event_pump.poll_iter() {
         match event {
             Event::Quit { .. } => {
@@ -519,8 +515,6 @@ fn poll_sdl_input(ctx: &mut EmuCtx) {
     if keys.is_scancode_pressed(Scancode::X) { btns |= KEY_B; }
     if keys.is_scancode_pressed(Scancode::C) { btns |= KEY_SELECT; }
     if keys.is_scancode_pressed(Scancode::Return) { btns |= KEY_START; }
-    if keys.is_scancode_pressed(Scancode::A) { btns |= KEY_L; }
-    if keys.is_scancode_pressed(Scancode::S) { btns |= KEY_R; }
     ctx.hle.buttons = btns;
 }
 
@@ -535,17 +529,16 @@ fn hle_sys_judge_event(ctx: &mut EmuCtx) {
 
 fn hle_kbd_get_status(ctx: &mut EmuCtx) {
     let out_ptr = ctx.cpu.gpr(4);
-    // 12-byte struct: i16 x, i16 y, u32 buttons, u32 prev_buttons
-    ctx.mem.write_u16(out_ptr, 0); // x
-    ctx.mem.write_u16(out_ptr + 2, 0); // y
-    ctx.mem.write_u32(out_ptr + 4, ctx.hle.buttons);
-    ctx.mem.write_u32(out_ptr + 8, ctx.hle.buttons_prev);
+    // 12-byte struct: u32 field0, u32 field1, u32 buttons
+    // Game's input_dispatch reads buttons from offset 8 and does its own prev tracking
+    ctx.mem.write_u32(out_ptr, 0);     // field0 (unused/x)
+    ctx.mem.write_u32(out_ptr + 4, 0); // field1 (unused/y)
+    ctx.mem.write_u32(out_ptr + 8, ctx.hle.buttons);
 }
 
 fn hle_kbd_get_key(ctx: &mut EmuCtx) {
-    // Return newly pressed keys (edge detection)
-    let newly = ctx.hle.buttons & !ctx.hle.buttons_prev;
-    ctx.cpu.set_gpr(2, newly);
+    // Return current button state (game does its own edge detection)
+    ctx.cpu.set_gpr(2, ctx.hle.buttons);
 }
 
 fn hle_get_game_vol(ctx: &mut EmuCtx) {
