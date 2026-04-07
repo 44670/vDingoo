@@ -2,6 +2,7 @@ use crate::bsp::{Bsp, BspFace, BspTexinfo};
 use crate::entity::EntityManager;
 use crate::fs_app::AppFs;
 use crate::texture;
+use crate::trigger::TriggerSystem;
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -683,6 +684,79 @@ impl DebugRenderer {
                 gl::UniformMatrix4fv(self.u_mvp, 1, gl::FALSE, mvp.as_ref().as_ptr());
                 let color = ent.type_id.color();
                 gl::Uniform3f(self.u_color, color[0], color[1], color[2]);
+
+                gl::DrawElements(
+                    gl::LINES,
+                    CUBE_LINES.len() as i32,
+                    gl::UNSIGNED_SHORT,
+                    std::ptr::null(),
+                );
+            }
+
+            gl::BindVertexArray(0);
+        }
+    }
+
+    /// Render a grid on the XZ plane at Y=0 for model viewers.
+    pub fn render_grid(&self, vp: &Mat4, size: f32, spacing: f32) {
+        let steps = (size / spacing) as i32;
+        let half = steps as f32 * spacing;
+
+        // Build line vertices dynamically
+        let mut verts: Vec<[f32; 3]> = Vec::new();
+        for i in -steps..=steps {
+            let p = i as f32 * spacing;
+            // X-axis parallel lines
+            verts.push([-half, 0.0, p]);
+            verts.push([half, 0.0, p]);
+            // Z-axis parallel lines
+            verts.push([p, 0.0, -half]);
+            verts.push([p, 0.0, half]);
+        }
+
+        let mut grid_vao = 0u32;
+        let mut grid_vbo = 0u32;
+        unsafe {
+            gl::GenVertexArrays(1, &mut grid_vao);
+            gl::GenBuffers(1, &mut grid_vbo);
+            gl::BindVertexArray(grid_vao);
+            gl::BindBuffer(gl::ARRAY_BUFFER, grid_vbo);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                (verts.len() * 12) as isize,
+                verts.as_ptr() as *const _,
+                gl::STREAM_DRAW,
+            );
+            gl::VertexAttribPointer(0, 3, gl::FLOAT, gl::FALSE, 12, std::ptr::null());
+            gl::EnableVertexAttribArray(0);
+
+            gl::UseProgram(self.shader);
+            gl::UniformMatrix4fv(self.u_mvp, 1, gl::FALSE, vp.as_ref().as_ptr());
+            gl::Uniform3f(self.u_color, 0.3, 0.3, 0.3);
+            gl::LineWidth(1.0);
+            gl::DrawArrays(gl::LINES, 0, verts.len() as i32);
+
+            gl::BindVertexArray(0);
+            gl::DeleteBuffers(1, &grid_vbo);
+            gl::DeleteVertexArrays(1, &grid_vao);
+        }
+    }
+
+    pub fn render_triggers(&self, vp: &Mat4, triggers: &TriggerSystem) {
+        unsafe {
+            gl::UseProgram(self.shader);
+            gl::BindVertexArray(self.vao);
+            gl::LineWidth(1.0);
+
+            for trigger in triggers.triggers() {
+                let model = Mat4::from_translation(trigger.center)
+                    * Mat4::from_scale(trigger.half_extents * 2.0);
+                let mvp = *vp * model;
+
+                gl::UniformMatrix4fv(self.u_mvp, 1, gl::FALSE, mvp.as_ref().as_ptr());
+                let color = trigger.type_id.color();
+                let alpha = if trigger.was_inside { 1.0 } else { 0.4 };
+                gl::Uniform3f(self.u_color, color[0] * alpha, color[1] * alpha, color[2] * alpha);
 
                 gl::DrawElements(
                     gl::LINES,

@@ -58,27 +58,39 @@ pub struct BspFace {
     pub styles: [u8; 4],
 }
 
-// Placeholder structs for future PVS culling
-#[allow(dead_code)]
+/// BSP node for collision tree traversal.
 #[derive(Debug, Clone)]
 pub struct BspNode {
     pub plane_idx: u32,
-    pub children: [i32; 2],
+    pub children: [i32; 2],  // negative = -(leaf_index), positive = node_index
     pub mins: [i16; 3],
     pub maxs: [i16; 3],
     pub first_face: u16,
     pub num_faces: u16,
 }
 
-#[allow(dead_code)]
+/// BSP leaf — terminal node of BSP tree.
 #[derive(Debug, Clone)]
 pub struct BspLeaf {
+    pub contents: i16,       // bit 0 = solid
     pub cluster: i16,
-    pub area: i16,
     pub mins: [i16; 3],
     pub maxs: [i16; 3],
-    pub first_leaf_face: u16,
-    pub num_leaf_faces: u16,
+    pub first_leaf_brush: u16,
+    pub num_leaf_brushes: u16,
+}
+
+/// A convex brush defined by a set of planes.
+#[derive(Debug, Clone)]
+pub struct BspBrush {
+    pub first_side: u16,
+    pub num_sides: u16,
+}
+
+/// A brush side — references a plane.
+#[derive(Debug, Clone)]
+pub struct BspBrushSide {
+    pub plane_index: u16,
 }
 
 #[allow(dead_code)]
@@ -132,6 +144,12 @@ pub struct Bsp {
     pub camera_spots: Vec<BspCameraSpot>,
     pub entities: Vec<BspEntity>,
     pub epair_strings: Vec<String>,
+    // Collision data
+    pub nodes: Vec<BspNode>,
+    pub leaves: Vec<BspLeaf>,
+    pub brushes: Vec<BspBrush>,
+    pub brush_sides: Vec<BspBrushSide>,
+    pub leaf_brushes: Vec<u32>,  // indices into brushes[]
 }
 
 struct LumpDir {
@@ -185,6 +203,12 @@ impl Bsp {
         let texinfo_lump = read_lump_dir(data, 0x40);
         let face_lump = read_lump_dir(data, 0x48);
         let lightmap_lump = read_lump_dir(data, 0xf0);
+        // Collision lumps
+        let brush_lump = read_lump_dir(data, 0x50);
+        let brush_side_lump = read_lump_dir(data, 0x58);
+        let leaf_brush_lump = read_lump_dir(data, 0xb8);
+        let leaf_lump = read_lump_dir(data, 0xd8);
+        let node_lump = read_lump_dir(data, 0xe0);
 
         // Parse vertices (12 bytes each: 3 × f32)
         let vertex_count = vertex_lump.size / 12;
@@ -292,6 +316,88 @@ impl Bsp {
         // Lightmap data (raw bytes)
         let lightmap_data = data[lightmap_lump.offset..lightmap_lump.offset + lightmap_lump.size]
             .to_vec();
+
+        // Parse collision data: brushes (4 bytes each: first_side i16, num_sides i16)
+        let brush_count = brush_lump.size / 4;
+        let mut brushes = Vec::with_capacity(brush_count);
+        for i in 0..brush_count {
+            let off = brush_lump.offset + i * 4;
+            brushes.push(BspBrush {
+                first_side: read_i16_le(data, off) as u16,
+                num_sides: read_i16_le(data, off + 2) as u16,
+            });
+        }
+
+        // Brush sides (4 bytes each: plane_index u16, surface_flags u16)
+        let brush_side_count = brush_side_lump.size / 4;
+        let mut brush_sides = Vec::with_capacity(brush_side_count);
+        for i in 0..brush_side_count {
+            let off = brush_side_lump.offset + i * 4;
+            brush_sides.push(BspBrushSide {
+                plane_index: read_u16_le(data, off),
+            });
+        }
+
+        // Leaf brush list (4 bytes each: i32 brush index)
+        let leaf_brush_count = leaf_brush_lump.size / 4;
+        let mut leaf_brushes = Vec::with_capacity(leaf_brush_count);
+        for i in 0..leaf_brush_count {
+            leaf_brushes.push(read_u32_le(data, leaf_brush_lump.offset + i * 4));
+        }
+
+        // Leaves (0x20 = 32 bytes each on disk)
+        let leaf_count = leaf_lump.size / 0x20;
+        let mut leaves = Vec::with_capacity(leaf_count);
+        for i in 0..leaf_count {
+            let off = leaf_lump.offset + i * 0x20;
+            leaves.push(BspLeaf {
+                contents: read_i16_le(data, off + 0x0C),
+                cluster: read_i16_le(data, off + 0x0E),
+                mins: [
+                    read_i16_le(data, off),
+                    read_i16_le(data, off + 2),
+                    read_i16_le(data, off + 4),
+                ],
+                maxs: [
+                    read_i16_le(data, off + 6),
+                    read_i16_le(data, off + 8),
+                    read_i16_le(data, off + 10),
+                ],
+                first_leaf_brush: read_u16_le(data, off + 0x10),
+                num_leaf_brushes: read_u16_le(data, off + 0x12),
+            });
+        }
+
+        // Nodes (0x18 = 24 bytes each on disk)
+        let node_count = node_lump.size / 0x18;
+        let mut nodes = Vec::with_capacity(node_count);
+        for i in 0..node_count {
+            let off = node_lump.offset + i * 0x18;
+            nodes.push(BspNode {
+                plane_idx: read_u32_le(data, off),
+                children: [
+                    read_i16_le(data, off + 4) as i32,
+                    read_i16_le(data, off + 6) as i32,
+                ],
+                mins: [
+                    read_i16_le(data, off + 8),
+                    read_i16_le(data, off + 10),
+                    read_i16_le(data, off + 12),
+                ],
+                maxs: [
+                    read_i16_le(data, off + 14),
+                    read_i16_le(data, off + 16),
+                    read_i16_le(data, off + 18),
+                ],
+                first_face: read_u16_le(data, off + 0x14),
+                num_faces: read_u16_le(data, off + 0x16),
+            });
+        }
+
+        println!(
+            "BSP collision: {} nodes, {} leaves, {} brushes, {} brush_sides, {} leaf_brushes",
+            nodes.len(), leaves.len(), brushes.len(), brush_sides.len(), leaf_brushes.len(),
+        );
 
         // Compute actual bounds from vertices (header bbox is unreliable)
         let mut bbox_min = [f32::MAX; 3];
@@ -451,6 +557,11 @@ impl Bsp {
             camera_spots,
             entities,
             epair_strings,
+            nodes,
+            leaves,
+            brushes,
+            brush_sides,
+            leaf_brushes,
         }
     }
 

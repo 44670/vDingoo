@@ -267,6 +267,41 @@ All 3113 functions named — zero `sub_*` remaining (100% coverage).
 | `0x80adad94` | `StateMachine_enterState` | Enter state machine state |
 | `0x80adae3c` | `StateMachine_update` | Update state machine |
 
+**BSP Collision:**
+
+| Address | Name | Description |
+|---------|------|-------------|
+| `0x80a7dd7c` | `Bsp_traceRaySimple` | Point-in-leaf test |
+| `0x80a7dec8` | `Bsp_traceRaySlide` | Ray trace with surface slide |
+| `0x80a7e3ac` | `Bsp_traceRayRecursive` | Core ray-BSP recursive intersection |
+| `0x80a7ea9c` | `Bsp_traceBox` | Static AABB overlap test |
+| `0x80a7ec98` | `Bsp_traceBoxSwept` | AABB sweep through BSP tree |
+| `0x80a7f1f8` | `Bsp_traceLeafBrushes` | AABB vs brush planes in leaf |
+| `0x80a7f78c` | `Bsp_traceSubmodels` | Trace against BSP submodels (doors) |
+| `0x80a7f898` | `Bsp_traceNodeRecursive` | Recursive BSP node traversal for AABB |
+| `0x80a800d8` | `Bsp_checkLeafSolid` | Check if leaf is solid |
+
+**Physics/Movement:**
+
+| Address | Name | Description |
+|---------|------|-------------|
+| `0x80a91640` | `PhysicsEntity_updatePhysics` | Main physics update (gravity, move, collide) |
+| `0x80a91b6c` | `PhysicsEntity_moveAndSlide` | Quake-style iterative slide move (5 iters) |
+| `0x80a92868` | `PhysicsEntity_moveAndCollide` | Simple collision (no sliding) |
+| `0x80a92ab0` | `PhysicsEntity_traceGround` | Ground detection (trace 0.5 units down) |
+| `0x80abf724` | `PhysicUnit_update` | Projectile physics (friction + bounce) |
+| `0x80a8f354` | `CollisionWorld_queryBox` | Query entities overlapping AABB |
+| `0x80a8f210` | `CollisionWorld_querySegment` | Segment/ray entity query |
+
+**Player:**
+
+| Address | Name | Description |
+|---------|------|-------------|
+| `0x80a39350` | `Player_takeDamage` | Damage entry point (invincibility check) |
+| `0x80a39bf4` | `Player_applyDamage` | Apply damage to HP, set hurt/dead flags |
+| `0x80a3ab50` | `Player_selectAttackAnim` | Choose combo animation from weapon set |
+| `0x80a29800` | `InputMapping_setDefaults` | Default button mappings |
+
 **Software Rasterizer:**
 
 | Address | Name | Description |
@@ -664,12 +699,58 @@ Stream (0x80ad90d4)
 
 ### 8b. Animation Resources (`.sai` format)
 
-`AnimRes` (RTTI "7AnimRes" at 0x80adce88) parses `.sai` binary animation files:
+`AnimRes` (RTTI "7AnimRes" at 0x80adce88, size 0xf8) parses `.sai` binary animation files.
 
-- Compressed 3x4 bone matrices with 16-bit values and per-component sign flags (9 bits)
-- Optional vertex animation tracks
-- `AnimRes_sampleBoneMatrix` — interpolate bone matrix at time t
-- `AnimRes_sampleVertexAnim` — interpolate vertex animation at time t
+**SAI Binary Format (no magic header, flat sequential):**
+
+```
+Header (12 bytes):
+  i32 total_frames        // total animation duration in frames
+  i32 loop_frame          // frame to loop back to (or total duration for non-looping)
+  i32 flags               // lower byte = rest_pose_count, bit 0x100 = has_vertex_anim
+
+RestPose[rest_pose_count] (24 bytes each):
+  i32[3] vec3_a           // 16.16 fp (reference transform / bind pose bbox)
+  i32[3] vec3_b           // 16.16 fp
+
+u32 bone_track_count      // number of bone keyframe tracks
+
+BoneTrack[bone_track_count]:
+  i32 keyframe_count
+  BoneKeyframe[keyframe_count] (36 bytes each):
+    i32  frame_time       // frame index for this keyframe
+    u16  sign_flags       // 9 bits, one per rotation matrix element
+    u16[9] rotation       // 3×3 rotation matrix magnitudes (unsigned, 0.16 fp)
+    i32[3] translation    // tx, ty, tz in 16.16 fp
+
+(if flags & 0x100) Vertex Animation:
+  u16 verts_per_frame     // must be 2 for vertex anim
+  i16 frame_count
+  VertexTrack[frame_count]:
+    i32 keyframe_count
+    vec3_fp[keyframe_count × verts_per_frame]  // 12 bytes each (3 × i32 16.16 fp)
+```
+
+**BoneKeyframe disk→memory expansion (36 bytes → 68 bytes):**
+
+Each keyframe on disk is 36 bytes. In memory it expands to a 4×4 homogeneous transform matrix (17 × i32):
+- `[0]` = frame_time
+- `[1-3]` = rotation row 0 (with signs from sign_flags bits 0-2), `[4]` = 0
+- `[5-7]` = rotation row 1 (bits 3-5), `[8]` = 0
+- `[9-11]` = rotation row 2 (bits 6-8), `[12]` = 0
+- `[13-15]` = translation (tx, ty, tz)
+- `[16]` = 0x10000 (1.0 in fixed-point)
+
+**Interpolation** (`AnimRes_sampleBoneMatrix` at 0x80a76a30):
+- Uses `lookupSin` table (at 0x80aeddf0) for smooth ease-in/out interpolation factor
+- For each of 15 matrix elements (3×3 rotation + 3 translation): `result = prev + (next - prev) * t`
+- Elements [3], [7], [11] (homogeneous column) are copied directly from prev keyframe
+- Vertex animation uses `vec3_lerp` with same interpolation factor
+
+**Key functions:**
+- `AnimRes_loadFromMemory` (0x80a763fc) — parser
+- `AnimRes_sampleBoneMatrix` (0x80a76a30) — bone interpolation (args: self, out_matrix, track_idx, frame)
+- `AnimRes_sampleVertexAnim` (0x80a773dc) — vertex interpolation
 - `AnimNode` — animation tree nodes with parent resolution
 - `AnimTrack` — tagged animation tracks (findByTag, init, deserialize)
 
@@ -1327,16 +1408,181 @@ All offsets are byte offsets from `this`. All 3D coordinates use 16.16 fixed-poi
 +0x168  int32_t        shakeAmplitude
 ```
 
-### Player (extends Creature/CameraTrigger, ~0xF40 bytes, vtable 0x80adaab0)
+### PhysicsEntity (extends GameUnit, physics-enabled entity base)
 
 ```c
-+0x0C   vec3_fp        position            // inherited from GameUnit
-+0x6F0  StateMachine   state_machine       // inline, 0x10 bytes
-+0x700  DummySpot      camera_spot
-+0x7AC  void*          input_mapping
-+0x7B4  Sword*         sword               // operator_new(0x27C)
-+0x860  vec3_fp        impulse             // physics impulse (damped ×0xF333/frame)
+// Inherited from GameUnit:
++0x00   void*          vtable
++0x04   int32_t        entity_type
++0x0C   vec3_fp        position            // x, y, z in 16.16 fp
++0x18   vec3_fp        aabb_min            // local-space AABB
++0x24   vec3_fp        aabb_max
++0x30   vec3_fp        world_aabb_min      // = pos + aabb_min
++0x3C   vec3_fp        world_aabb_max
+
+// PhysicsEntity-specific:
++0x90   uint32_t       flags               // bitfield (see below)
++0x94   vec3_fp        prev_position       // saved each frame
++0xA0   vec3_fp        velocity            // x, y, z in 16.16 fp
++0xAC   int16_t        turn_amount         // Y-axis rotation per tick
++0xB0   int32_t        gravity             // default 0x8000 (0.5 in 16.16)
++0xB4   vec3_fp        col_aabb_min        // collision AABB from SOJ model
++0xC0   vec3_fp        col_aabb_max
++0xCC   vec3_fp        world_col_aabb_min  // computed each frame
++0xD8   vec3_fp        world_col_aabb_max
++0xE4   TraceResult    trace_result        // 12 × i32 (48 bytes)
++0x114  Bsp*           bsp                 // scene BSP for collision
++0x118  void*          collision_world     // entity-entity colliders
++0x128  int32_t        on_ground           // 1 = grounded
++0x12C  vec3_fp        ground_normal       // floor plane normal
++0x554  int32_t        has_colliders       // entity collision registered
++0x65C  int32_t        collided_x          // per-axis collision flags
++0x660  int32_t        collided_y
++0x664  int32_t        collided_z
 ```
+
+**PhysicsEntity flags (bitfield at +0x90):**
+
+| Bit | Hex | Meaning |
+|-----|-----|---------|
+| 0 | 0x01 | Gravity enabled |
+| 1 | 0x02 | Use moveAndSlide (vs simple position add) |
+| 2 | 0x04 | Collision callback selection (vtable 0x54 vs 0x50) |
+| 3 | 0x08 | Step-up enabled (stair stepping) |
+| 4 | 0x10 | Step-up active (with ground check) |
+| 5 | 0x20 | Lock X position |
+| 6 | 0x40 | Lock Y position |
+| 7 | 0x80 | Lock Z position |
+| 8 | 0x100 | Skip moveAndSlide/moveAndCollide dispatch |
+| 9 | 0x200 | Y-axis separate (split Y from XZ in moveAndSlide) |
+
+**TraceResult (48 bytes at +0xE4):**
+
+```c
+struct TraceResult {
+    vec3_fp  hit_position;     // +0x00
+    int32_t  hit_type;         // +0x0C (0=no hit, 1=solid)
+    vec3_fp  hit_normal;       // +0x10
+    int32_t  plane_dist;       // +0x1C
+    int32_t  is_solid;         // +0x20
+    int32_t  starts_in_solid;  // +0x24
+    int32_t  hit_fraction;     // +0x28 (0x10000 = 1.0 = no hit)
+    int32_t  surface_flags;    // +0x2C
+};
+```
+
+**Movement system** (`PhysicsEntity_updatePhysics` at 0x80a91640):
+1. Save prev_position
+2. Apply gravity: if (flags & 0x01) && !on_ground → velocity.y -= gravity
+3. Dispatch to vtable[0x3C] for movement direction application
+4. If flags & 0x02: `moveAndSlide` (Quake-style iterative, up to 5 iterations)
+5. Else: simple position += velocity (with axis locking)
+6. Step-up detection (flags 0x08/0x10)
+7. Update world AABB
+
+**moveAndSlide** (`0x80a91b6c`): Iterative plane-clipping slide move:
+- Sweep AABB through BSP via `Bsp_traceBoxSwept`
+- Collect up to 5 hit plane normals
+- Reflect velocity off each plane, re-normalize to preserve speed
+- Stop if velocity reverses direction or becomes small (< 0x28F)
+
+**Key physics constants:**
+
+| Constant | Value | Fixed-Point | Meaning |
+|----------|-------|-------------|---------|
+| Gravity | 0x8000 | 0.5 | Per-tick gravity acceleration |
+| Velocity dead zone | 0x28F | ~0.01 | Below this = zero velocity |
+| Friction (PhysicUnit) | 0xF333 | ~0.95 | Per-tick velocity multiplier |
+| Reflection bias | 0x28F | ~0.01 | Over-reflection to prevent sticking |
+| Max slide iterations | 5 | - | Collision response iterations |
+| Hit fraction 1.0 | 0x10000 | 1.0 | Full sweep, no collision |
+
+### Player (extends PhysicsEntity, size 0xF44 bytes, vtable 0x80adaab0)
+
+```c
+// Inherited from PhysicsEntity (see above)
++0x0C   vec3_fp        position
++0x90   uint32_t       flags
++0xA0   vec3_fp        velocity
+
+// Player-specific:
++0x6B4  int32_t        move_speed          // 16.16 fp, default 0xCCCC (~0.8)
++0x6D0  int32_t        movement_lock       // 0 = can move
++0x6F0  StateMachine   state_machine       // inline, 0x10 bytes
++0x6FC  int32_t        attack_damage       // damage dealt to enemies
++0x700  void*          state_table         // container with 20 state objects
++0x708  Camera*        camera
++0x718  int32_t        death_counter       // incremented on death
++0x728  int32_t        invincible          // if set, takeDamage returns
++0x730  int32_t        hp                  // current health (50 initial)
++0x73C  void*          hurt_sound_name     // pointer to sound name
++0x794  int32_t        weapon_set          // 0, 1, or 2 — selects combo chain
++0x7AC  void*          input_mapping       // InputMapping* (SDT input device)
++0x7B0  void*          game_engine         // GameEngine*
++0x7B4  Sword*         sword               // operator_new(0x27C)
++0x7B8  int32_t        hurt1_pending       // → Hurt1 state
++0x7BC  int32_t        hurt2_pending       // → Hurt2 state
++0x7C0  int32_t        hurt3_pending       // → Hurt3 state
++0x7C4  int32_t        die_pending         // → Hurt4 state
++0x7C8  int32_t        death_type          // 0=alive, 1=dying, 2=dead
++0x7CC  int32_t        dead_flag           // 0=alive, 1=HP depleted, 2=anim done
++0x7D0  void*          last_damage_source  // attacker GameUnit*
++0x7D8  vec3_fp        knockback_dir       // knockback direction (16.16 fp)
++0x7E4  int32_t        state_timer         // generic counter (hurt, QTE, FPS)
++0x7E8  int32_t        combo_hit_counter   // attack chain counter
++0x7F8  int32_t        combo_pending       // combo continuation flag
++0x7FC  int32_t        heavy_attack        // heavy attack flag
++0x800  int32_t        airborne            // falling flag
++0x9BC  void*          push_target         // pushable entity pointer
++0x9C0  int32_t        qte_timer
++0x9C4  int32_t        qte_interval
++0x9C8  int32_t        qte_required        // required button presses
++0x9CC  int32_t        qte_success_count
++0x9D0  int32_t        qte_target_button
++0x9D4  int32_t        qte_result          // -1=pending, 0=fail, 1=success
+```
+
+**Player state IDs and animation mappings:**
+
+| ID | State | Anim ID | Notes |
+|----|-------|---------|-------|
+| 0 | Stand | 0 | Idle, checks for attack input |
+| 1 | Run | 1 | Movement, push detection |
+| 2 | AttackA1 | 2 | Light combo chain start |
+| 3 | AttackA2 | 3 | Light combo hit 2 |
+| 4 | AttackA3 | 4 | Light combo finisher |
+| 5 | AttackB1 | 5 | Medium combo chain start |
+| 6 | AttackB2 | 6 | Medium combo hit 2 |
+| 7 | AttackB3 | 7 | Medium combo finisher |
+| 8 | AttackC1 | 5 | Heavy combo chain start |
+| 9 | AttackC2 | 6 | Heavy combo hit 2 |
+| 10 | AttackC3 | 7 | Heavy combo finisher |
+| 11 | Hurt1 | 8 | Light hit reaction |
+| 12 | Hurt2 | 11/12 | Knockback hit |
+| 13 | Hurt3 | 12 | Strong knockback with velocity |
+| 14 | Hurt4 | 12 | Death trigger (timer-based) |
+| 15 | Die | 9/11 | Death animation, sets dead_flag=2 |
+| 16 | Push | 10 | Pushing pushable objects |
+| 17 | QTE | - | Quick Time Event (button prompt) |
+| 18 | Hide | - | Hidden, exit on attack/interact |
+| 19 | FPS | - | First-person view mode |
+
+**State transition priority** (checked in ALL states):
+1. dead_flag != 0 → Die
+2. hurt1_pending → Hurt1
+3. hurt2_pending → Hurt2
+4. hurt3_pending → Hurt3
+5. die_pending → Hurt4
+
+**Damage system** (`Player_takeDamage` at 0x80a39350):
+- If invincible flag set → return
+- Reads damage from `*(source + 0x6FC)` (attacker's attack_damage field)
+- Subtracts from HP; if HP <= 0 → dead_flag = 1, death_counter++
+- If HP > 0 → hurt1_pending = 1
+
+**Initial values** (from `Scene_resetPlayerState`):
+- HP = 50 (0x32), Max HP = 100 (0x64)
+- Per-floor attack speeds: Floor 0: (0.1, 0.2), Floor 1: (0.4, 0.8), Floor 2: (0.4, 1.0)
 
 ### StateMachine (0x10 bytes, vtable 0x80adab48)
 

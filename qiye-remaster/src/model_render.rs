@@ -1,5 +1,6 @@
 /// GL renderer for SOJ models.
 
+use crate::animation::{AnimController, SaiAnimation};
 use crate::fs_app::AppFs;
 use crate::model::SojModel;
 use crate::texture;
@@ -112,6 +113,8 @@ pub struct ModelRenderer {
     fallback_tex: u32,
     texture_cache: HashMap<String, u32>,
     models: HashMap<String, GpuModel>,
+    animations: HashMap<String, SaiAnimation>,
+    anim_controllers: HashMap<String, AnimController>,
 }
 
 impl ModelRenderer {
@@ -158,6 +161,8 @@ impl ModelRenderer {
             fallback_tex,
             texture_cache: HashMap::new(),
             models: HashMap::new(),
+            animations: HashMap::new(),
+            anim_controllers: HashMap::new(),
         }
     }
 
@@ -322,5 +327,79 @@ impl ModelRenderer {
 
     pub fn has_model(&self, name: &str) -> bool {
         self.models.contains_key(name)
+    }
+
+    /// Try to load a SAI animation for a model name. Returns true if loaded.
+    pub fn load_animation(&mut self, model_name: &str, fs: &AppFs) -> bool {
+        if self.animations.contains_key(model_name) {
+            return true;
+        }
+
+        // SAI file shares the model's base name
+        let sai_path = format!(".\\common\\{}", model_name.replace(".soj", ".sai"));
+        if let Some(data) = fs.read(&sai_path) {
+            if let Some(anim) = SaiAnimation::parse(data) {
+                let ctrl = AnimController::new(&anim);
+                self.animations.insert(model_name.to_string(), anim);
+                self.anim_controllers.insert(model_name.to_string(), ctrl);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Update all animation controllers.
+    pub fn update_animations(&mut self, dt: f32) {
+        for (name, ctrl) in &mut self.anim_controllers {
+            if let Some(anim) = self.animations.get(name) {
+                let _ = anim; // used implicitly via ctrl which references frame counts
+                ctrl.update(dt);
+            }
+        }
+    }
+
+    /// Get the animated bone matrix for track 0 of a model's animation (if any).
+    pub fn get_anim_matrix(&self, model_name: &str) -> Option<Mat4> {
+        let ctrl = self.anim_controllers.get(model_name)?;
+        let anim = self.animations.get(model_name)?;
+        if anim.bone_tracks.is_empty() {
+            return None;
+        }
+
+        let m = anim.sample_bone(0, ctrl.current_frame);
+        // Convert row-major BoneMatrix [16] to glam Mat4 (column-major)
+        Some(Mat4::from_cols_array(&[
+            m[0], m[1], m[2], m[3],
+            m[4], m[5], m[6], m[7],
+            m[8], m[9], m[10], m[11],
+            m[12], m[13], m[14], m[15],
+        ]))
+    }
+
+    /// Get animation info for HUD display: (current_frame, total_frames, playing).
+    pub fn get_anim_info(&self, model_name: &str) -> Option<(f32, i32, bool)> {
+        let ctrl = self.anim_controllers.get(model_name)?;
+        Some((ctrl.current_frame, ctrl.total_frames(), ctrl.playing))
+    }
+
+    /// Toggle animation playback for a model.
+    pub fn toggle_animation(&mut self, model_name: &str) {
+        if let Some(ctrl) = self.anim_controllers.get_mut(model_name) {
+            ctrl.playing = !ctrl.playing;
+        }
+    }
+
+    /// Reset animation to frame 0.
+    pub fn reset_animation(&mut self, model_name: &str) {
+        if let Some(ctrl) = self.anim_controllers.get_mut(model_name) {
+            ctrl.current_frame = 0.0;
+        }
+    }
+
+    /// Get model stats: (total_indices, material_count).
+    pub fn get_model_stats(&self, model_name: &str) -> Option<(usize, usize)> {
+        let m = self.models.get(model_name)?;
+        let indices: usize = m.draw_calls.iter().map(|d| d.index_count).sum();
+        Some((indices, m.draw_calls.len()))
     }
 }

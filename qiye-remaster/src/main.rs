@@ -1,15 +1,24 @@
+mod animation;
+mod audio;
 mod bsp;
+mod camera;
+mod enemy;
 mod entity;
 mod fs_app;
 mod game;
+mod game_data;
 mod input;
 mod model;
 mod model_render;
 mod packed_string;
+mod player;
 mod render;
 mod script;
 mod texture;
 mod time;
+mod trigger;
+mod ui;
+mod viewer;
 
 fn find_bsp(fs: &fs_app::AppFs, name: Option<&str>) -> Option<String> {
     if let Some(name) = name {
@@ -44,13 +53,70 @@ fn find_bsp(fs: &fs_app::AppFs, name: Option<&str>) -> Option<String> {
         .or_else(|| bsp_files.first().cloned())
 }
 
+fn init_sdl(title: &str) -> (sdl2::Sdl, sdl2::video::Window, sdl2::video::GLContext, sdl2::EventPump) {
+    let sdl = sdl2::init().unwrap();
+    let video = sdl.video().unwrap();
+
+    let gl_attr = video.gl_attr();
+    gl_attr.set_context_profile(sdl2::video::GLProfile::Core);
+    gl_attr.set_context_version(3, 3);
+    gl_attr.set_depth_size(24);
+    gl_attr.set_stencil_size(8);
+
+    let window = video
+        .window(title, 1280, 720)
+        .opengl()
+        .resizable()
+        .build()
+        .unwrap();
+
+    let gl_context = window.gl_create_context().unwrap();
+    gl::load_with(|s| video.gl_get_proc_address(s) as *const _);
+
+    unsafe {
+        gl::Enable(gl::DEPTH_TEST);
+        gl::Disable(gl::CULL_FACE);
+        gl::ClearColor(0.1, 0.1, 0.15, 1.0);
+    }
+
+    let mut event_pump = sdl.event_pump().unwrap();
+    sdl.mouse().set_relative_mouse_mode(true);
+    event_pump.poll_iter().for_each(drop);
+
+    (sdl, window, gl_context, event_pump)
+}
+
+fn print_usage() {
+    eprintln!("Usage: qiye-remaster <app_path> [mode] [args...]");
+    eprintln!();
+    eprintln!("Modes:");
+    eprintln!("  play [map]    Full gameplay (default)");
+    eprintln!("  bsp  [map]    BSP map viewer — free-cam, map cycling");
+    eprintln!("  obj  <name>   SOJ model viewer — orbit camera, animation");
+    eprintln!("  npc  <name>   NPC/player viewer — state machine, movement");
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  qiye-remaster ../qiye.app");
+    eprintln!("  qiye-remaster ../qiye.app play \".\\day1\\0101.sbp\"");
+    eprintln!("  qiye-remaster ../qiye.app bsp");
+    eprintln!("  qiye-remaster ../qiye.app obj r_ken_a");
+    eprintln!("  qiye-remaster ../qiye.app npc r_ken_a");
+}
+
 fn main() {
-    let app_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "../qiye.app".to_string());
+    let args: Vec<String> = std::env::args().collect();
+
+    let app_path = args.get(1).map(|s| s.as_str()).unwrap_or("../qiye.app");
+    let mode = args.get(2).map(|s| s.as_str()).unwrap_or("play");
+
+    // Check for help flag
+    if app_path == "--help" || app_path == "-h" {
+        print_usage();
+        return;
+    }
 
     println!("Loading {app_path}...");
-    let fs = fs_app::AppFs::open(&app_path);
+    let fs = fs_app::AppFs::open(app_path);
     println!("PAK: {} files", fs.file_count());
 
     // List file extensions
@@ -71,43 +137,58 @@ fn main() {
         println!("  {ext}: {count}");
     }
 
-    // Find and load BSP
-    let bsp_name = std::env::args().nth(2);
-    let bsp_path = find_bsp(&fs, bsp_name.as_deref()).expect("No BSP file found in PAK");
-    println!("Loading BSP: {bsp_path}");
-    let bsp_data = fs.read(&bsp_path).unwrap();
-    let bsp = bsp::Bsp::parse(bsp_data);
+    match mode {
+        "play" => {
+            let bsp_name = args.get(3).map(|s| s.as_str());
+            let bsp_path = find_bsp(&fs, bsp_name).expect("No BSP file found in PAK");
+            println!("Loading BSP: {bsp_path}");
+            let bsp_data = fs.read(&bsp_path).unwrap();
+            let bsp = bsp::Bsp::parse(bsp_data);
 
-    // SDL2 init
-    let sdl = sdl2::init().unwrap();
-    let video = sdl.video().unwrap();
+            let (sdl, window, _gl_context, mut event_pump) = init_sdl("七夜 Remaster");
+            let sdl_audio = sdl.audio().unwrap();
+            let audio_system = audio::AudioSystem::new(&sdl_audio);
 
-    let gl_attr = video.gl_attr();
-    gl_attr.set_context_profile(sdl2::video::GLProfile::Core);
-    gl_attr.set_context_version(3, 3);
-    gl_attr.set_depth_size(24);
-    gl_attr.set_stencil_size(8);
+            let mut game = game::Game::new(fs, &bsp, &bsp_path, audio_system);
+            game.run(&window, &mut event_pump);
+        }
+        "bsp" => {
+            let bsp_name = args.get(3).map(|s| s.as_str());
+            let bsp_path = find_bsp(&fs, bsp_name).expect("No BSP file found in PAK");
+            println!("Loading BSP: {bsp_path}");
+            let bsp_data = fs.read(&bsp_path).unwrap();
+            let bsp = bsp::Bsp::parse(bsp_data);
 
-    let window = video
-        .window("七夜 Remaster", 1280, 720)
-        .opengl()
-        .resizable()
-        .build()
-        .unwrap();
-
-    let _gl_context = window.gl_create_context().unwrap();
-    gl::load_with(|s| video.gl_get_proc_address(s) as *const _);
-
-    unsafe {
-        gl::Enable(gl::DEPTH_TEST);
-        gl::Disable(gl::CULL_FACE);
-        gl::ClearColor(0.1, 0.1, 0.15, 1.0);
+            let (_sdl, window, _gl_context, mut event_pump) = init_sdl("七夜 — BSP Viewer");
+            viewer::run_bsp(fs, &bsp, &bsp_path, &window, &mut event_pump);
+        }
+        "obj" => {
+            let model_name = match args.get(3) {
+                Some(n) => n.as_str(),
+                None => {
+                    eprintln!("Error: obj mode requires a model name");
+                    print_usage();
+                    return;
+                }
+            };
+            let (_sdl, window, _gl_context, mut event_pump) = init_sdl(&format!("七夜 — OBJ: {model_name}"));
+            viewer::run_obj(&fs, model_name, &window, &mut event_pump);
+        }
+        "npc" => {
+            let model_name = match args.get(3) {
+                Some(n) => n.as_str(),
+                None => {
+                    eprintln!("Error: npc mode requires a model name");
+                    print_usage();
+                    return;
+                }
+            };
+            let (_sdl, window, _gl_context, mut event_pump) = init_sdl(&format!("七夜 — NPC: {model_name}"));
+            viewer::run_npc(&fs, model_name, &window, &mut event_pump);
+        }
+        _ => {
+            eprintln!("Unknown mode: {mode}");
+            print_usage();
+        }
     }
-
-    let mut event_pump = sdl.event_pump().unwrap();
-    sdl.mouse().set_relative_mouse_mode(true);
-    event_pump.poll_iter().for_each(drop);
-
-    let mut game = game::Game::new(fs, &bsp, &bsp_path);
-    game.run(&window, &mut event_pump);
 }
