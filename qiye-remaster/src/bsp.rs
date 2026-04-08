@@ -489,6 +489,21 @@ impl Bsp {
                         if ep_start + 1 < epair_strings.len() {
                             position = parse_vec3(&epair_strings[ep_start + 1]);
                         }
+                    } else {
+                        // Unknown entity type — try to find a position in EPairs
+                        // Dump EPair data for debugging
+                        let ep_end = (ep_start + ep_count as usize).min(epair_strings.len());
+                        println!("  Entity type {ent_type} (model_idx={model_idx}) EPairs:");
+                        for j in ep_start..ep_end {
+                            println!("    [{j}] {:?}", &epair_strings[j]);
+                        }
+                        // Try each EPair as a potential position
+                        for j in ep_start..ep_end {
+                            if let Some(p) = parse_vec3(&epair_strings[j]) {
+                                position = Some(p);
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -599,30 +614,79 @@ impl TraceResult {
 }
 
 /// Swept AABB trace state.
+/// 1:1 conversion from original binary (Bsp_traceBoxSwept + helpers).
+///
+/// Key conventions from original RE:
+/// - Plane distance: n·p + d (NOT n·p - d as in Quake). The on-disk `dist`
+///   field encodes `d` from the equation `ax + by + cz + d = 0`.
+/// - Brush AABB offset: selection vector picks the AABB corner closest to
+///   the brush plane (based on normal sign), NOT symmetric extent.
+/// - Non-axial node offset: adds +5.0 padding to avoid missing brushes.
 struct TraceState<'a> {
     bsp: &'a Bsp,
-    start: [f32; 3],
-    end: [f32; 3],
-    mins: [f32; 3],   // AABB min (relative, e.g. [-0.5, 0, -0.5])
-    maxs: [f32; 3],   // AABB max (relative, e.g. [0.5, 2.0, 0.5])
-    extents: [f32; 3], // half-extents for each axis
-    fraction: f32,
-    normal: [f32; 3],
-    all_solid: bool,
+    start: [f32; 3],     // original trace start (used by brush test)
+    end: [f32; 3],       // original trace end (used by brush test)
+    mins: [f32; 3],      // AABB min (e.g. [-0.5, 0, -0.5])
+    maxs: [f32; 3],      // AABB max (e.g. [0.5, 2.0, 0.5])
+    extents: [f32; 3],   // max(-mins[i], maxs[i]) for node traversal
+    fraction: f32,       // best hit fraction so far (0..1)
+    normal: [f32; 3],    // hit surface normal
+    all_solid: bool,     // started inside solid brush
+    hit_contents: bool,  // did we register a hit
+    brush_side_idx: i32, // brush side index of hit (-1 if none)
 }
 
 impl Bsp {
+    /// Debug version with verbose tracing.
+    pub fn trace_box_debug(&self, start: [f32; 3], end: [f32; 3], mins: [f32; 3], maxs: [f32; 3]) -> TraceResult {
+        if self.nodes.is_empty() {
+            return TraceResult::no_hit(end);
+        }
+        let extents = [
+            (-mins[0]).max(maxs[0]),
+            (-mins[1]).max(maxs[1]),
+            (-mins[2]).max(maxs[2]),
+        ];
+        let mut state = TraceState {
+            bsp: self,
+            start,
+            end,
+            mins,
+            maxs,
+            extents,
+            fraction: 1.0,
+            normal: [0.0; 3],
+            all_solid: false,
+            hit_contents: false,
+            brush_side_idx: -1,
+        };
+        state.trace_node_debug(0, 0.0, 1.0, start, end, 0);
+        if state.all_solid {
+            state.fraction = 0.0;
+        }
+        if state.fraction >= 1.0 {
+            TraceResult { fraction: 1.0, end_pos: end, normal: [0.0; 3], hit: false, all_solid: false }
+        } else {
+            let eps = 0.02;
+            let mut pos = [0.0f32; 3];
+            for i in 0..3 { pos[i] = start[i] + (end[i] - start[i]) * state.fraction + state.normal[i] * eps; }
+            TraceResult { fraction: state.fraction, end_pos: pos, normal: state.normal, hit: true, all_solid: state.all_solid }
+        }
+    }
+
     /// Swept AABB trace from `start` to `end` with box defined by `mins`/`maxs`.
-    /// Mirrors `Bsp_traceBoxSwept` from the original binary.
+    /// Mirrors `Bsp_traceBoxSwept` (0x80a7ece4) from the original binary.
     pub fn trace_box(&self, start: [f32; 3], end: [f32; 3], mins: [f32; 3], maxs: [f32; 3]) -> TraceResult {
         if self.nodes.is_empty() {
             return TraceResult::no_hit(end);
         }
 
+        // Original: extents[i] = max(-mins[i], maxs[i])
+        // Used for node traversal offset (coarse spatial check)
         let extents = [
-            maxs[0].abs().max(mins[0].abs()),
-            maxs[1].abs().max(mins[1].abs()),
-            maxs[2].abs().max(mins[2].abs()),
+            (-mins[0]).max(maxs[0]),
+            (-mins[1]).max(maxs[1]),
+            (-mins[2]).max(maxs[2]),
         ];
 
         let mut state = TraceState {
@@ -635,48 +699,140 @@ impl Bsp {
             fraction: 1.0,
             normal: [0.0; 3],
             all_solid: false,
+            hit_contents: false,
+            brush_side_idx: -1,
         };
 
         state.trace_node(0, 0.0, 1.0, start, end);
 
+        // Original: if all_solid, fraction = 0
         if state.all_solid {
-            return TraceResult {
-                fraction: 0.0,
-                end_pos: start,
-                normal: [0.0; 3],
-                hit: true,
-                all_solid: true,
-            };
+            state.fraction = 0.0;
         }
 
-        if state.fraction < 1.0 {
-            // Lerp position and nudge off surface
+        if state.fraction >= 1.0 {
+            // No hit — end position is the destination
+            TraceResult {
+                fraction: 1.0,
+                end_pos: end,
+                normal: [0.0; 3],
+                hit: false,
+                all_solid: false,
+            }
+        } else {
+            // Hit — lerp to fraction and nudge off surface by 0.02 along normal
+            // Original: nudge = 0x51E/65536 ≈ 0.02, applied per-component as
+            // sign(normal[i]) * abs(normal[i]) * eps = normal[i] * eps
+            state.hit_contents = true;
             let eps = 0.02;
             let mut pos = [0.0f32; 3];
             for i in 0..3 {
-                pos[i] = start[i] + (end[i] - start[i]) * state.fraction + state.normal[i] * eps;
+                pos[i] = start[i] + (end[i] - start[i]) * state.fraction;
+            }
+            // Nudge off surface
+            for i in 0..3 {
+                pos[i] += state.normal[i] * eps;
             }
             TraceResult {
                 fraction: state.fraction,
                 end_pos: pos,
                 normal: state.normal,
                 hit: true,
-                all_solid: false,
+                all_solid: state.all_solid,
             }
-        } else {
-            TraceResult::no_hit(end)
         }
     }
 }
 
 impl<'a> TraceState<'a> {
-    /// Recursive BSP node traversal (mirrors Bsp_traceNodeRecursive).
+    fn trace_node_debug(&mut self, node_idx: i32, start_frac: f32, end_frac: f32, start: [f32; 3], end: [f32; 3], depth: usize) {
+        let indent = "  ".repeat(depth);
+        if start_frac >= self.fraction {
+            println!("{indent}Node {node_idx}: pruned (start_frac {start_frac:.3} >= fraction {:.3})", self.fraction);
+            return;
+        }
+        if node_idx < 0 {
+            let leaf_idx = (-node_idx) as usize;
+            if leaf_idx < self.bsp.leaves.len() {
+                let leaf = &self.bsp.leaves[leaf_idx];
+                println!("{indent}Leaf {leaf_idx}: contents={} first_lb={} num_lb={}",
+                    leaf.contents, leaf.first_leaf_brush, leaf.num_leaf_brushes);
+                self.trace_leaf(leaf_idx);
+                println!("{indent}  → after leaf: frac={:.3} hit={} solid={}", self.fraction, self.hit_contents, self.all_solid);
+            } else {
+                println!("{indent}Leaf {leaf_idx}: OUT OF BOUNDS (max={})", self.bsp.leaves.len());
+            }
+            return;
+        }
+        let node_idx_u = node_idx as usize;
+        if node_idx_u >= self.bsp.nodes.len() { return; }
+        let node = &self.bsp.nodes[node_idx_u];
+        let plane = &self.bsp.planes[node.plane_idx as usize];
+        let n = &plane.normal;
+        let axis_type = plane.type_flags;
+        let (start_dist, end_dist, offset) = if axis_type < 3 {
+            let ax = axis_type as usize;
+            (start[ax] + plane.dist, end[ax] + plane.dist, self.extents[ax])
+        } else {
+            let sd = n[0]*start[0] + n[1]*start[1] + n[2]*start[2] + plane.dist;
+            let ed = n[0]*end[0] + n[1]*end[1] + n[2]*end[2] + plane.dist;
+            let off = self.extents[0]*n[0].abs() + self.extents[1]*n[1].abs() + self.extents[2]*n[2].abs() + 5.0;
+            (sd, ed, off)
+        };
+        println!("{indent}Node {node_idx}: plane(n=({:.2},{:.2},{:.2}) d={:.2} t={}) sd={:.3} ed={:.3} off={:.3} children=[{},{}]",
+            n[0], n[1], n[2], plane.dist, axis_type, start_dist, end_dist, offset, node.children[0], node.children[1]);
+        if start_dist >= offset && end_dist >= offset {
+            println!("{indent}  → both front → child[0]={}", node.children[0]);
+            self.trace_node_debug(node.children[0], start_frac, end_frac, start, end, depth+1);
+            return;
+        }
+        if start_dist < -offset && end_dist < -offset {
+            println!("{indent}  → both back → child[1]={}", node.children[1]);
+            self.trace_node_debug(node.children[1], start_frac, end_frac, start, end, depth+1);
+            return;
+        }
+        println!("{indent}  → straddle, splitting");
+        // Use same split logic as the real trace_node
+        let delta = start_dist - end_dist;
+        let (near_child, far_child, t_near, t_far);
+        if start_dist < end_dist {
+            near_child = 1usize; far_child = 0;
+            if delta.abs() < 0.004 { t_near = 1.0; t_far = 0.0; }
+            else { let r = 1.0/delta; t_near = ((start_dist+offset)*r).clamp(0.0,1.0); t_far = ((start_dist-offset)*r).clamp(0.0,1.0); }
+        } else if delta.abs() >= 0.004 {
+            near_child = 0; far_child = 1;
+            let r = 1.0/delta; t_near = ((start_dist-offset)*r).clamp(0.0,1.0); t_far = ((start_dist+offset)*r).clamp(0.0,1.0);
+        } else {
+            println!("{indent}  → near-equal, front only");
+            self.trace_node_debug(node.children[0], start_frac, end_frac, start, end, depth+1);
+            return;
+        }
+        println!("{indent}  near={} (child[{}]), far={} (child[{}]) t_near={:.3} t_far={:.3}",
+            node.children[near_child], near_child, node.children[far_child], far_child, t_near, t_far);
+        let children = node.children;
+        {
+            let mid_frac = start_frac + (end_frac - start_frac) * t_near;
+            let mid = [start[0]+(end[0]-start[0])*t_near, start[1]+(end[1]-start[1])*t_near, start[2]+(end[2]-start[2])*t_near];
+            self.trace_node_debug(children[near_child], start_frac, mid_frac, start, mid, depth+1);
+        }
+        {
+            let mid_frac = start_frac + (end_frac - start_frac) * t_far;
+            let mid = [start[0]+(end[0]-start[0])*t_far, start[1]+(end[1]-start[1])*t_far, start[2]+(end[2]-start[2])*t_far];
+            self.trace_node_debug(children[far_child], mid_frac, end_frac, mid, end, depth+1);
+        }
+    }
+
+    /// Recursive BSP node traversal.
+    /// Mirrors `Bsp_traceNodeRecursive` (0x80a7f8e0).
     fn trace_node(&mut self, node_idx: i32, start_frac: f32, end_frac: f32, start: [f32; 3], end: [f32; 3]) {
-        if start_frac > self.fraction {
-            return; // already found a closer hit
+        // Original: if start_frac >= fraction, return early
+        if start_frac >= self.fraction {
+            return;
         }
 
-        // Leaf node
+        // Leaf node: negative index = -(leaf_index)
+        // Original: *node == -1 means node (dword[0]=-1), bit0 set means leaf.
+        // In our index-based approach: negative child = leaf index.
         if node_idx < 0 {
             let leaf_idx = (-node_idx) as usize;
             if leaf_idx < self.bsp.leaves.len() {
@@ -685,82 +841,117 @@ impl<'a> TraceState<'a> {
             return;
         }
 
-        let node_idx = node_idx as usize;
-        if node_idx >= self.bsp.nodes.len() {
+        let node_idx_u = node_idx as usize;
+        if node_idx_u >= self.bsp.nodes.len() {
             return;
         }
 
-        let node = &self.bsp.nodes[node_idx];
+        let node = &self.bsp.nodes[node_idx_u];
         let plane_idx = node.plane_idx as usize;
         if plane_idx >= self.bsp.planes.len() {
             return;
         }
         let plane = &self.bsp.planes[plane_idx];
 
-        // Compute distances from start/end to plane, offset by AABB extent
+        // Compute signed distances from start/end to plane and the AABB offset.
+        // Original convention: distance = component + dist (for axial)
+        //                    = dot(normal, pos) + dist (for non-axial)
         let (start_dist, end_dist, offset) = {
             let n = &plane.normal;
             let axis_type = plane.type_flags;
             if axis_type < 3 {
-                // Axial plane — just use the relevant component
+                // Axial plane: distance = pos[axis] + plane.dist
                 let ax = axis_type as usize;
-                (start[ax] - plane.dist, end[ax] - plane.dist, self.extents[ax])
+                let sd = start[ax] + plane.dist;
+                let ed = end[ax] + plane.dist;
+                let off = self.extents[ax];
+                (sd, ed, off)
             } else {
-                let sd = n[0] * start[0] + n[1] * start[1] + n[2] * start[2] - plane.dist;
-                let ed = n[0] * end[0] + n[1] * end[1] + n[2] * end[2] - plane.dist;
-                let off = self.extents[0] * n[0].abs() + self.extents[1] * n[1].abs() + self.extents[2] * n[2].abs();
+                // Non-axial: dot(normal, pos) + dist
+                let sd = n[0] * start[0] + n[1] * start[1] + n[2] * start[2] + plane.dist;
+                let ed = n[0] * end[0] + n[1] * end[1] + n[2] * end[2] + plane.dist;
+                // Offset = sum(|extent[i] * normal[i]|) + 5.0 padding
+                // Original adds 0x50000 (= 5.0 in 16.16) for non-axial planes
+                let off = self.extents[0] * n[0].abs()
+                        + self.extents[1] * n[1].abs()
+                        + self.extents[2] * n[2].abs()
+                        + 5.0;
                 (sd, ed, off)
             }
         };
 
-        // Both on front side
+        let children = node.children;
+
+        // Both on front side: trace front child only
         if start_dist >= offset && end_dist >= offset {
-            self.trace_node(node.children[0], start_frac, end_frac, start, end);
+            self.trace_node(children[0], start_frac, end_frac, start, end);
             return;
         }
-        // Both on back side
+        // Both on back side: trace back child only
         if start_dist < -offset && end_dist < -offset {
-            self.trace_node(node.children[1], start_frac, end_frac, start, end);
+            self.trace_node(children[1], start_frac, end_frac, start, end);
             return;
         }
 
-        // Crosses the plane — split the trace
-        let inv_dist = start_dist - end_dist;
-        let (front_child, back_child, t1, t2) = if start_dist < end_dist {
-            // Moving from back to front
-            let t1 = if inv_dist != 0.0 { (start_dist + offset) / inv_dist } else { 1.0 };
-            let t2 = if inv_dist != 0.0 { (start_dist - offset) / inv_dist } else { 0.0 };
-            (1i32, 0i32, t1, t2)
-        } else if start_dist > end_dist {
-            // Moving from front to back
-            let t1 = if inv_dist != 0.0 { (start_dist - offset) / inv_dist } else { 1.0 };
-            let t2 = if inv_dist != 0.0 { (start_dist + offset) / inv_dist } else { 0.0 };
-            (0, 1, t1, t2)
-        } else {
-            (0, 1, 1.0, 0.0)
-        };
+        // Straddling the plane — need to split the trace
+        let delta = start_dist - end_dist;
 
-        let t1 = t1.clamp(0.0, 1.0);
-        let t2 = t2.clamp(0.0, 1.0);
+        // Determine near/far children and split fractions
+        // near_child: the side the trace starts on
+        // Original uses fixedpoint_sqrt_a (reciprocal) for division
+        let (near_child, far_child, t_near, t_far);
+
+        if start_dist < end_dist {
+            // Moving from back to front
+            near_child = 1usize; // back child first
+            far_child = 0usize;  // then front child
+            if delta.abs() < 0.004 {
+                // Near-zero delta: trace both with full range
+                t_near = 1.0f32;
+                t_far = 0.0f32;
+            } else {
+                let recip = 1.0 / delta;
+                t_near = ((start_dist + offset) * recip).clamp(0.0, 1.0);
+                t_far = ((start_dist - offset) * recip).clamp(0.0, 1.0);
+            }
+        } else if delta.abs() >= 0.004 {
+            // Moving from front to back (or equal with significant delta)
+            near_child = 0;
+            far_child = 1;
+            let recip = 1.0 / delta;
+            t_near = ((start_dist - offset) * recip).clamp(0.0, 1.0);
+            t_far = ((start_dist + offset) * recip).clamp(0.0, 1.0);
+        } else {
+            // Near-equal distances, small delta: trace front child only
+            self.trace_node(children[0], start_frac, end_frac, start, end);
+            return;
+        }
 
         // Trace near side first
-        let mid_frac = start_frac + (end_frac - start_frac) * t1;
-        let mut mid = [0.0f32; 3];
-        for i in 0..3 {
-            mid[i] = start[i] + (end[i] - start[i]) * t1;
+        {
+            let mid_frac = start_frac + (end_frac - start_frac) * t_near;
+            let mid = [
+                start[0] + (end[0] - start[0]) * t_near,
+                start[1] + (end[1] - start[1]) * t_near,
+                start[2] + (end[2] - start[2]) * t_near,
+            ];
+            self.trace_node(children[near_child], start_frac, mid_frac, start, mid);
         }
-        self.trace_node(node.children[front_child as usize], start_frac, mid_frac, start, mid);
 
         // Trace far side
-        let mid_frac2 = start_frac + (end_frac - start_frac) * t2;
-        let mut mid2 = [0.0f32; 3];
-        for i in 0..3 {
-            mid2[i] = start[i] + (end[i] - start[i]) * t2;
+        {
+            let mid_frac = start_frac + (end_frac - start_frac) * t_far;
+            let mid = [
+                start[0] + (end[0] - start[0]) * t_far,
+                start[1] + (end[1] - start[1]) * t_far,
+                start[2] + (end[2] - start[2]) * t_far,
+            ];
+            self.trace_node(children[far_child], mid_frac, end_frac, mid, end);
         }
-        self.trace_node(node.children[back_child as usize], mid_frac2, end_frac, mid2, end);
     }
 
-    /// Test trace against all brushes in a leaf (mirrors Bsp_traceLeafBrushes).
+    /// Test trace against all brushes in a leaf.
+    /// Mirrors `Bsp_traceSubmodels` (0x80a7f7a8).
     fn trace_leaf(&mut self, leaf_idx: usize) {
         let leaf = &self.bsp.leaves[leaf_idx];
         let first = leaf.first_leaf_brush as usize;
@@ -776,10 +967,20 @@ impl<'a> TraceState<'a> {
                 continue;
             }
             self.trace_brush(brush_idx);
+            // Original: early out if fraction becomes 0 (all_solid)
+            if self.fraction < f32::EPSILON {
+                break;
+            }
         }
     }
 
-    /// Test trace against a single brush (mirrors brush test in Bsp_traceLeafBrushes).
+    /// Test trace against a single brush.
+    /// Mirrors `Bsp_traceLeafBrushes` (0x80a7f23c).
+    ///
+    /// Key difference from Quake: AABB offset uses a selection vector that picks
+    /// the AABB corner based on the sign of the plane normal, rather than using
+    /// symmetric abs(n)·extents. This correctly handles asymmetric AABBs like
+    /// the player (mins.y=0, maxs.y=2).
     fn trace_brush(&mut self, brush_idx: usize) {
         let brush = &self.bsp.brushes[brush_idx];
         if brush.num_sides == 0 {
@@ -789,8 +990,10 @@ impl<'a> TraceState<'a> {
         let mut enter_frac = -1.0f32;
         let mut leave_frac = 1.0f32;
         let mut hit_normal = [0.0f32; 3];
+        let mut _hit_dist = 0.0f32;
         let mut starts_out = false;
         let mut ends_out = false;
+        let mut clip_side_idx: i32 = -1;
 
         for s in 0..brush.num_sides as usize {
             let side_idx = brush.first_side as usize + s;
@@ -802,56 +1005,86 @@ impl<'a> TraceState<'a> {
                 return;
             }
             let plane = &self.bsp.planes[plane_idx];
-
-            // Compute distance from start/end, offset by AABB extent along plane normal
             let n = &plane.normal;
-            let offset = self.extents[0] * n[0].abs()
-                       + self.extents[1] * n[1].abs()
-                       + self.extents[2] * n[2].abs();
 
+            // Build selection vector: pick AABB corner based on normal sign.
+            // For each axis: if normal >= 0, use mins[axis] (the "behind" corner);
+            //                if normal <  0, use maxs[axis] (the "behind" corner).
+            // Then adjusted_dist = plane.dist + dot(selection, normal)
+            let mut sel_dot = 0.0f32;
+            for j in 0..3 {
+                if n[j] >= 0.0 {
+                    sel_dot += n[j] * self.mins[j];
+                } else {
+                    sel_dot += n[j] * self.maxs[j];
+                }
+            }
+            let adjusted_dist = plane.dist + sel_dot;
+
+            // Signed distances: dot(pos, normal) + adjusted_dist
             let start_dist = n[0] * self.start[0] + n[1] * self.start[1] + n[2] * self.start[2]
-                           - plane.dist - offset;
+                           + adjusted_dist;
             let end_dist = n[0] * self.end[0] + n[1] * self.end[1] + n[2] * self.end[2]
-                         - plane.dist - offset;
+                         + adjusted_dist;
 
-            if start_dist > 0.0 { starts_out = true; }
+            // Track whether start/end are outside any brush plane
             if end_dist > 0.0 { ends_out = true; }
+            if start_dist > 0.0 { starts_out = true; }
 
-            // Both outside this plane — not inside brush
-            if start_dist > 0.0 && end_dist > 0.0 {
+            // Both outside this plane → definitely not inside brush
+            if start_dist > 0.0 && end_dist >= 0.0 {
                 return;
             }
-            // Both inside this plane — skip (still may be inside brush)
+            // Check the other case too
+            if start_dist >= 0.0 && end_dist > 0.0 {
+                return;
+            }
+
+            // Both inside this plane → continue to next side
             if start_dist <= 0.0 && end_dist <= 0.0 {
                 continue;
             }
 
-            let inv = 1.0 / (start_dist - end_dist);
+            // Crossing this plane — compute intersection fraction
+            let delta = start_dist - end_dist;
+            if delta.abs() < f32::EPSILON {
+                continue;
+            }
+            let frac = start_dist / delta;
+
             if start_dist > end_dist {
-                // Entering the brush
-                let f = (start_dist - 0.02) * inv;
-                if f > enter_frac {
-                    enter_frac = f;
+                // Entering the brush (going from outside to inside)
+                if frac > enter_frac {
+                    enter_frac = frac;
                     hit_normal = [n[0], n[1], n[2]];
+                    _hit_dist = plane.dist;
+                    clip_side_idx = side_idx as i32;
                 }
             } else {
-                // Leaving the brush
-                let f = (start_dist + 0.02) * inv;
-                if f < leave_frac {
-                    leave_frac = f;
+                // Leaving the brush (going from inside to outside)
+                if frac < leave_frac {
+                    leave_frac = frac;
                 }
             }
         }
 
-        if !starts_out {
-            self.all_solid = !ends_out;
-            return;
-        }
-
-        if enter_frac < leave_frac && enter_frac > -1.0 && enter_frac < self.fraction {
-            let f = enter_frac.max(0.0);
-            self.fraction = f;
-            self.normal = hit_normal;
+        // Check if the start point is inside the brush
+        if starts_out {
+            // Started outside — check for valid brush intersection
+            if enter_frac < leave_frac {
+                if enter_frac > -1.0 && enter_frac < self.fraction {
+                    let f = enter_frac.max(0.0);
+                    self.fraction = f;
+                    self.normal = hit_normal;
+                    self.brush_side_idx = clip_side_idx;
+                }
+            }
+        } else {
+            // Started inside the brush
+            self.hit_contents = true;
+            if !ends_out {
+                self.all_solid = true;
+            }
         }
     }
 }

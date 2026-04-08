@@ -1,3 +1,4 @@
+mod aot_qiye;
 mod fs;
 mod hle;
 mod loader;
@@ -13,6 +14,7 @@ use loader::load_ccdl_relocated;
 use mem::Memory;
 use mips::{Cpu, StepResult};
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 // ── Global CPU pointer for panic hook ────────────────────────────────────────
@@ -73,6 +75,7 @@ fn main() {
         panic!("app path must begin with \"nand/\": {app_path}");
     }
     let trace = args.iter().any(|a| a == "--trace");
+    let profile = args.iter().any(|a| a == "--profile");
     let max_insns: u64 = args
         .iter()
         .position(|a| a == "--max-insns")
@@ -166,7 +169,7 @@ fn main() {
             fs: &mut guest_fs,
             sdl: &mut sdl_state,
         };
-        run_until_sentinel(&mut ctx, trace, max_insns);
+        run_until_sentinel(&mut ctx, trace, profile, max_insns);
     }
 
     // Look up AppMain from exports
@@ -209,13 +212,18 @@ fn main() {
             fs: &mut guest_fs,
             sdl: &mut sdl_state,
         };
-        run_until_sentinel(&mut ctx, trace, max_insns);
+        run_until_sentinel(&mut ctx, trace, profile, max_insns);
     }
 
     eprintln!("\nTotal instructions: {}", cpu.insn_count);
 }
 
-fn run_until_sentinel(ctx: &mut EmuCtx, trace: bool, max_insns: u64) {
+fn run_until_sentinel(ctx: &mut EmuCtx, trace: bool, profile: bool, max_insns: u64) {
+    // Profiler: sample PC every N instructions, aggregate by address
+    const SAMPLE_INTERVAL: u64 = 512;
+    let mut pc_samples: HashMap<u32, u64> = HashMap::new();
+    let mut next_sample = SAMPLE_INTERVAL;
+
     loop {
         if ctx.cpu.insn_count >= max_insns {
             eprintln!("\n[STOP] max instructions reached ({max_insns}) at PC=0x{:08x}", ctx.cpu.pc);
@@ -227,6 +235,18 @@ fn run_until_sentinel(ctx: &mut EmuCtx, trace: bool, max_insns: u64) {
         }
 
         let pre_pc = ctx.cpu.pc;
+
+        // AOT: skip interpreter for hot functions
+        if pre_pc == 0x80a86c40 {
+            aot_qiye::renderer_draw_textured_spans(&mut ctx.cpu, ctx.mem);
+            ctx.cpu.insn_count += 893; // ~893 instructions per call on average
+            if profile {
+                *pc_samples.entry(pre_pc).or_insert(0) += 1;
+                next_sample = ctx.cpu.insn_count + SAMPLE_INTERVAL;
+            }
+            continue;
+        }
+
         match ctx.cpu.step(ctx.mem) {
             StepResult::Ok => {
                 // Audio watchpoints — key audio functions
@@ -242,6 +262,11 @@ fn run_until_sentinel(ctx: &mut EmuCtx, trace: bool, max_insns: u64) {
                 if trace {
                     let insn = ctx.mem.read_u32(pre_pc);
                     eprintln!("[{:08}] {:08x}: {:08x}", ctx.cpu.insn_count, pre_pc, insn);
+                }
+                // Profile sampling
+                if profile && ctx.cpu.insn_count >= next_sample {
+                    *pc_samples.entry(pre_pc).or_insert(0) += 1;
+                    next_sample = ctx.cpu.insn_count + SAMPLE_INTERVAL;
                 }
             }
             StepResult::OutOfText => {
@@ -270,6 +295,109 @@ fn run_until_sentinel(ctx: &mut EmuCtx, trace: bool, max_insns: u64) {
             }
         }
     }
+
+    if profile {
+        print_profile(&pc_samples, ctx.cpu.code_start, ctx.cpu.code_end);
+    }
+}
+
+/// Load function names from BN disassembly export (if available)
+fn load_function_map(path: &str) -> Vec<(u32, u32, String)> {
+    let mut funcs = Vec::new();
+    let Ok(content) = std::fs::read_to_string(path) else { return funcs };
+    // Match function header lines: "80a00000    type name(args)"
+    // These have 4+ spaces after the 8-hex-digit address (instructions have 2 spaces then hex)
+    for line in content.lines() {
+        if line.len() < 14 { continue; }
+        let addr_str = &line[..8];
+        // Must be followed by "    " (4 spaces) — function header, not instruction
+        if &line[8..12] != "    " { continue; }
+        // Instruction lines: "80a00000  deadbeef   ..." — 2 spaces then hex
+        // Skip if char at index 12 is a hex digit (it's an instruction)
+        if line.as_bytes().get(12).map_or(false, |&b| b.is_ascii_hexdigit()) { continue; }
+        let rest = line[12..].trim_start();
+        // Must contain '(' to be a function header
+        if !rest.contains('(') { continue; }
+        if let Some(paren_pos) = rest.find('(') {
+            let before = &rest[..paren_pos];
+            // Skip "extern" declarations (builtins, not real code)
+            if before.starts_with("extern") { continue; }
+            if let Some(name) = before.split_whitespace().last() {
+                // Skip pointer markers
+                let name = name.trim_start_matches('*');
+                if name.is_empty() { continue; }
+                if let Ok(addr) = u32::from_str_radix(addr_str, 16) {
+                    funcs.push((addr, 0u32, name.to_string()));
+                }
+            }
+        }
+    }
+    // Deduplicate (BN can list same address twice)
+    funcs.sort_by_key(|f| f.0);
+    funcs.dedup_by_key(|f| f.0);
+    // Compute sizes from gaps
+    for i in 0..funcs.len() {
+        if i + 1 < funcs.len() {
+            funcs[i].1 = funcs[i + 1].0 - funcs[i].0;
+        } else {
+            funcs[i].1 = 0x1000;
+        }
+    }
+    funcs
+}
+
+fn print_profile(pc_samples: &HashMap<u32, u64>, code_start: u32, _code_end: u32) {
+    let total_samples: u64 = pc_samples.values().sum();
+    if total_samples == 0 {
+        eprintln!("[PROFILE] No samples collected");
+        return;
+    }
+
+    // Try to load function names
+    let funcs = load_function_map("qiye.elf.bndb_disassembly.txt");
+
+    // Aggregate samples by function
+    let mut func_samples: HashMap<String, u64> = HashMap::new();
+    let mut unmatched: HashMap<u32, u64> = HashMap::new();
+
+    for (&pc, &count) in pc_samples {
+        // Binary search for the function containing this PC
+        let mut matched = false;
+        if !funcs.is_empty() {
+            let idx = funcs.partition_point(|f| f.0 <= pc);
+            if idx > 0 {
+                let f = &funcs[idx - 1];
+                if pc < f.0 + f.1 {
+                    *func_samples.entry(format!("0x{:08x} {}", f.0, f.2)).or_insert(0) += count;
+                    matched = true;
+                }
+            }
+        }
+        if !matched {
+            *unmatched.entry(pc).or_insert(0) += count;
+        }
+    }
+
+    // Sort by sample count
+    let mut sorted: Vec<_> = func_samples.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("║                    PROFILE HOTSPOTS                        ║");
+    eprintln!("║  Total samples: {:>10} (1 sample = ~{} insns)         ║", total_samples, 512);
+    eprintln!("╠══════════════════════════════════════════════════════════════╣");
+    eprintln!("║ {:>6} {:>5}  {:<47}║", "samples", "%", "function");
+    eprintln!("╠══════════════════════════════════════════════════════════════╣");
+    for (name, count) in sorted.iter().take(40) {
+        let pct = (*count as f64 / total_samples as f64) * 100.0;
+        eprintln!("║ {:>6} {:>5.1}%  {:<47}║", count, pct, name);
+    }
+    if !unmatched.is_empty() {
+        let unmatched_total: u64 = unmatched.values().sum();
+        let pct = (unmatched_total as f64 / total_samples as f64) * 100.0;
+        eprintln!("║ {:>6} {:>5.1}%  {:<47}║", unmatched_total, pct, "(unmatched addresses)");
+    }
+    eprintln!("╚══════════════════════════════════════════════════════════════╝");
 }
 
 /// Write a UTF-8 string as UCS-2 LE wide string to guest memory

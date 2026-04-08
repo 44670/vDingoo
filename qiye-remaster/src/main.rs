@@ -46,10 +46,13 @@ fn find_bsp(fs: &fs_app::AppFs, name: Option<&str>) -> Option<String> {
         println!("  ... and {} more", bsp_files.len() - 10);
     }
 
+    // Default: start at the study room (day1 map 1014)
+    // Original game: GameEngine_startNewGame → prepareEpisode(1,1) → Scene_loadDay(1)
     bsp_files
         .iter()
-        .find(|p| p.contains("day1"))
+        .find(|p| p.contains("day1") && p.contains("1014"))
         .cloned()
+        .or_else(|| bsp_files.iter().find(|p| p.contains("day1")).cloned())
         .or_else(|| bsp_files.first().cloned())
 }
 

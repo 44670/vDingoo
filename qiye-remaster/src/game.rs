@@ -74,22 +74,87 @@ impl Game {
         let model_key = "r_ken_a.soj";
         Self::load_model_with_anim(&mut model_renderer, model_key, "r_ken_stand_a.sai", &fs);
 
-        // Determine player start position from first camera spot
-        // Original: Scene_resetState calculates position from player facing direction
-        let player_pos = if let Some(spot) = bsp.camera_spots.first() {
+        // Determine player start position:
+        // 1. Use DummySpot entity (type 11) if available — this is the player spawn point
+        // 2. Fall back to camera spot (type 10)
+        // 3. Fall back to BSP center
+        // Original: player starts at (0,0,0), scripts position later. We pre-position since BSP is pre-loaded.
+        let player_pos = if let Some(ent) = bsp.entities.iter().find(|e| e.entity_type == 11) {
+            if let Some(pos) = ent.position {
+                println!("Player start: using DummySpot (type 11) at ({:.1},{:.1},{:.1})", pos[0], pos[1], pos[2]);
+                Vec3::from(pos)
+            } else if let Some(spot) = bsp.camera_spots.first() {
+                Vec3::from(spot.pos)
+            } else {
+                Vec3::ZERO
+            }
+        } else if let Some(spot) = bsp.camera_spots.first() {
+            println!("Player start: using camera spot at ({:.1},{:.1},{:.1})", spot.pos[0], spot.pos[1], spot.pos[2]);
             Vec3::from(spot.pos)
         } else {
-            // Fallback: center of BSP bounds
-            Vec3::new(
-                (bsp.bbox_min[0] + bsp.bbox_max[0]) * 0.5,
-                bsp.bbox_min[1] + 1.0,
-                (bsp.bbox_min[2] + bsp.bbox_max[2]) * 0.5,
-            )
+            Vec3::ZERO
         };
+
+        // Debug: dump BSP tree structure
+        {
+            println!("=== BSP TREE DUMP ===");
+            println!("Nodes: {}, Leaves: {}, Brushes: {}, BrushSides: {}, LeafBrushes: {}",
+                bsp.nodes.len(), bsp.leaves.len(), bsp.brushes.len(), bsp.brush_sides.len(), bsp.leaf_brushes.len());
+            for (i, node) in bsp.nodes.iter().enumerate() {
+                let p = &bsp.planes[node.plane_idx as usize];
+                println!("  Node[{i}]: plane={} n=({:.3},{:.3},{:.3}) d={:.3} type={} children=[{},{}]",
+                    node.plane_idx, p.normal[0], p.normal[1], p.normal[2], p.dist, p.type_flags,
+                    node.children[0], node.children[1]);
+            }
+            for (i, leaf) in bsp.leaves.iter().enumerate() {
+                println!("  Leaf[{i}]: contents={} first_lb={} num_lb={} cluster={}",
+                    leaf.contents, leaf.first_leaf_brush, leaf.num_leaf_brushes, leaf.cluster);
+            }
+            for (i, lb) in bsp.leaf_brushes.iter().enumerate() {
+                println!("  LeafBrush[{i}]: brush_idx={lb}");
+            }
+            for (i, brush) in bsp.brushes.iter().enumerate() {
+                let sides: Vec<String> = (0..brush.num_sides as usize).map(|s| {
+                    let si = brush.first_side as usize + s;
+                    let pi = bsp.brush_sides[si].plane_index;
+                    let p = &bsp.planes[pi as usize];
+                    format!("s{si}(p{pi} n=({:.2},{:.2},{:.2}) d={:.2})", p.normal[0], p.normal[1], p.normal[2], p.dist)
+                }).collect();
+                println!("  Brush[{i}]: first_side={} num_sides={} sides=[{}]",
+                    brush.first_side, brush.num_sides, sides.join(", "));
+            }
+            println!("=== END BSP TREE DUMP ===");
+        }
+
+        // Debug: test trace at various positions to verify BSP collision works
+        {
+            let mins = [0.0f32; 3];
+            let maxs = [0.0f32; 3];
+            let cx = (bsp.bbox_min[0] + bsp.bbox_max[0]) * 0.5;
+            let cz = (bsp.bbox_min[2] + bsp.bbox_max[2]) * 0.5;
+            // Point trace from BSP top center downward (with verbose debug)
+            println!("=== DEBUG TRACE: center ({cx:.1}, {:.1}, {cz:.1}) → ({cx:.1}, {:.1}, {cz:.1}) ===",
+                bsp.bbox_max[1], bsp.bbox_min[1]);
+            let t1 = bsp.trace_box_debug([cx, bsp.bbox_max[1], cz], [cx, bsp.bbox_min[1], cz], mins, maxs);
+            println!("DEBUG trace center ({:.1},{:.1},{:.1})→({:.1},{:.1},{:.1}): hit={} frac={:.3} solid={} n=({:.2},{:.2},{:.2})",
+                cx, bsp.bbox_max[1], cz, cx, bsp.bbox_min[1], cz,
+                t1.hit, t1.fraction, t1.all_solid, t1.normal[0], t1.normal[1], t1.normal[2]);
+            // Point trace from camera spot downward
+            let t2 = bsp.trace_box([110.9, -16.0, 110.5], [110.9, -34.0, 110.5], mins, maxs);
+            println!("DEBUG trace cam ({:.1},{:.1},{:.1})→({:.1},{:.1},{:.1}): hit={} frac={:.3} solid={}",
+                110.9, -16.0, 110.5, 110.9, -34.0, 110.5,
+                t2.hit, t2.fraction, t2.all_solid);
+            // Point trace from DummySpot downward
+            let t3 = bsp.trace_box([92.5, -16.0, 97.5], [92.5, -34.0, 97.5], mins, maxs);
+            println!("DEBUG trace dummy ({:.1},{:.1},{:.1})→({:.1},{:.1},{:.1}): hit={} frac={:.3} solid={}",
+                92.5, -16.0, 97.5, 92.5, -34.0, 97.5,
+                t3.hit, t3.fraction, t3.all_solid);
+        }
 
         let mut player = Player::new(player_pos);
         player.model_name = Some(model_key.to_string());
-        println!("Player: spawned at ({:.1}, {:.1}, {:.1})", player.pos.x, player.pos.y, player.pos.z);
+        // Original: GameUnit_groundCheck snaps player to floor after positioning
+        player.ground_snap(&bsp);
 
         // --- Scene_loadEnemyModels equivalent (day 1) ---
         // Day 1 loads: r_bully_a, r_nvyong_a, r_weed_a
@@ -100,11 +165,11 @@ impl Game {
         let ui_renderer = UiRenderer::new();
         let dialog = DialogBox::new();
 
-        // Camera follows player from the start
+        // Camera follows player from the start (use ground-snapped position)
         // Original: Camera_initFollowMode in prepareEpisode
         let mut camera = camera;
         camera.set_follow_mode(
-            player_pos + Vec3::new(0.0, 2.0, 0.0),
+            player.pos + Vec3::new(0.0, 2.0, 0.0),
             Vec3::new(0.0, 5.0, -10.0),
         );
 
@@ -342,9 +407,10 @@ impl Game {
             };
             player.pos = new_pos;
             player.velocity = Vec3::ZERO;
-            println!("Player: repositioned to ({:.1}, {:.1}, {:.1})", new_pos.x, new_pos.y, new_pos.z);
+            // Original: GameUnit_groundCheck snaps player to floor after positioning
+            player.ground_snap(&self.bsp);
             camera.set_follow_mode(
-                new_pos + Vec3::new(0.0, 2.0, 0.0),
+                player.pos + Vec3::new(0.0, 2.0, 0.0),
                 Vec3::new(0.0, 5.0, -10.0),
             );
         }

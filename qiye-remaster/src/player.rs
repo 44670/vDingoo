@@ -294,7 +294,8 @@ impl Player {
 
     /// Trace downward to detect ground contact (mirrors PhysicsEntity_traceGround).
     fn trace_ground(&mut self, bsp: &Bsp) {
-        let ground_check_dist = 0.5;
+        // Original GameUnit_groundCheck traces 10 units (0xA0000 in 16.16 fixed-point) downward
+        let ground_check_dist = 10.0;
         let start = [self.pos.x, self.pos.y, self.pos.z];
         let end = [self.pos.x, self.pos.y - ground_check_dist, self.pos.z];
 
@@ -310,6 +311,34 @@ impl Player {
             self.pos = Vec3::new(trace.end_pos[0], trace.end_pos[1], trace.end_pos[2]);
         } else {
             self.on_ground = false;
+        }
+    }
+
+    /// Snap player to the ground below. Mirrors Scene_loadPlayerAdult from the original binary.
+    /// Original traces from pos.y + 5 to pos.y - 10 (15 units total sweep).
+    pub fn ground_snap(&mut self, bsp: &Bsp) {
+        let start = [self.pos.x, self.pos.y + 5.0, self.pos.z];
+        let end = [self.pos.x, self.pos.y - 10.0, self.pos.z];
+
+        println!("Player: ground_snap trace from ({:.1},{:.1},{:.1}) to ({:.1},{:.1},{:.1})",
+            start[0], start[1], start[2], end[0], end[1], end[2]);
+        println!("  AABB mins={:?} maxs={:?}", Self::PLAYER_MINS, Self::PLAYER_MAXS);
+        println!("  BSP: {} nodes, {} leaves, {} brushes",
+            bsp.nodes.len(), bsp.leaves.len(), bsp.brushes.len());
+
+        let trace = bsp.trace_box(start, end, Self::PLAYER_MINS, Self::PLAYER_MAXS);
+        println!("  trace result: hit={} fraction={:.3} all_solid={} normal=({:.2},{:.2},{:.2}) end=({:.1},{:.1},{:.1})",
+            trace.hit, trace.fraction, trace.all_solid,
+            trace.normal[0], trace.normal[1], trace.normal[2],
+            trace.end_pos[0], trace.end_pos[1], trace.end_pos[2]);
+
+        if trace.hit {
+            self.pos = Vec3::new(trace.end_pos[0], trace.end_pos[1], trace.end_pos[2]);
+            self.on_ground = true;
+            self.velocity = Vec3::ZERO;
+            println!("Player: ground snap → ({:.1}, {:.1}, {:.1})", self.pos.x, self.pos.y, self.pos.z);
+        } else {
+            println!("Player: ground snap FAILED — no floor found below");
         }
     }
 
