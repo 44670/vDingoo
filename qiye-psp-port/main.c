@@ -20,7 +20,7 @@
 
 PSP_MODULE_INFO("vDingoo", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
-PSP_HEAP_SIZE_KB(-1024); /* leave 1MB for system, use rest for heap */
+PSP_HEAP_SIZE_KB(30 * 1024);
 
 /* ── Exit callbacks ───────────────────────────────────────────────────────── */
 
@@ -101,26 +101,34 @@ int main(int argc, char *argv[]) {
     printf("vDingoo PSP — CCDL native loader\n");
     printf("================================\n\n");
 
-    /* ── Load qiye.app ──────────────────────────────────────────────────── */
+    /* ── Load qiye.app header ──────────────────────────────────────────── */
+
+    /* On PSP we can't malloc the full 57MB app file.
+     * Strategy: read only the header to parse CCDL tables,
+     * then stream RAWD directly into target memory. */
 
     const char *app_path  = "ms0:/PSP/GAME/VDINGOO/nand/qiye.app";
     const char *reloc_path = "ms0:/PSP/GAME/VDINGOO/nand/qiye.reloc.bin";
 
-    uint32_t app_size = 0, reloc_size = 0;
-    uint8_t *app_data = load_file(app_path, &app_size);
-    if (!app_data) {
-        printf("ERROR: Cannot load %s\n", app_path);
-        printf("Place qiye.app in ms0:/PSP/GAME/VDINGOO/nand/\n");
+    /* Read CCDL header — first 4KB is more than enough for IMPT+EXPT tables */
+    #define HEADER_SIZE 4096
+    uint8_t header_buf[HEADER_SIZE];
+
+    SceUID app_fd = sceIoOpen(app_path, PSP_O_RDONLY, 0);
+    if (app_fd < 0) {
+        printf("ERROR: Cannot open %s (0x%08lx)\n", app_path, (unsigned long)app_fd);
         sceKernelSleepThread();
         return 1;
     }
-    printf("Loaded %s (%lu bytes)\n", app_path, (unsigned long)app_size);
+    sceIoRead(app_fd, header_buf, HEADER_SIZE);
+    printf("Opened %s\n", app_path);
 
+    /* Load reloc table (172KB — fits easily) */
+    uint32_t reloc_size = 0;
     uint8_t *reloc_data = load_file(reloc_path, &reloc_size);
     if (!reloc_data) {
         printf("ERROR: Cannot load %s\n", reloc_path);
-        printf("Place qiye.reloc.bin in ms0:/PSP/GAME/VDINGOO/nand/\n");
-        free(app_data);
+        sceIoClose(app_fd);
         sceKernelSleepThread();
         return 1;
     }
@@ -129,56 +137,36 @@ int main(int argc, char *argv[]) {
     /* ── Parse CCDL ─────────────────────────────────────────────────────── */
 
     CcdlBinary ccdl;
-    if (ccdl_parse(app_data, app_size, &ccdl) < 0) {
+    if (ccdl_parse(header_buf, HEADER_SIZE, &ccdl) < 0) {
         printf("ERROR: CCDL parse failed\n");
         goto fail;
     }
 
-    /* ── Allocate memory at 0x08A00000 ──────────────────────────────────── */
+    /* ── Allocate memory for game code+data+bss+trampolines ──────────────── */
 
-    /* We need contiguous memory from 0x08A00000 to cover code+data+bss,
-     * plus the framebuffer at 0x08F00000. Total: ~5.2 MB. */
-    uint32_t new_base = 0x08A00000;
-    uint32_t alloc_end = LCD_FRAMEBUF + LCD_W * LCD_H * 2;
-    uint32_t alloc_size = alloc_end - new_base;
+    /* Extra space after BSS for mul→mult/mflo trampolines (~4K mul insns × 16B) */
+    uint32_t alloc_size = ccdl.memory_size + 0x10000;
+    /* Also include framebuffer space after the code block */
+    uint32_t fb_offset = alloc_size;
+    alloc_size += LCD_W * LCD_H * 2;
 
-    printf("Allocating %lu bytes at 0x%08lx...\n",
-           (unsigned long)alloc_size, (unsigned long)new_base);
-
-    SceUID mem_block = sceKernelAllocPartitionMemory(
-        2, "qiye_mem", PSP_SMEM_Addr, alloc_size, (void *)new_base);
-
-    if (mem_block < 0) {
-        printf("ERROR: sceKernelAllocPartitionMemory failed (0x%08x)\n", (int)mem_block);
-        printf("Trying PSP_SMEM_Low fallback...\n");
-
-        /* Fallback: allocate from low address and hope it covers our range */
-        mem_block = sceKernelAllocPartitionMemory(
-            2, "qiye_mem", PSP_SMEM_Low, alloc_size + 0x200000, NULL);
-        if (mem_block < 0) {
-            printf("ERROR: fallback alloc also failed\n");
-            goto fail;
-        }
-        void *block_addr = sceKernelGetBlockHeadAddr(mem_block);
-        printf("Fallback block at %p\n", block_addr);
-        if ((uint32_t)block_addr > new_base) {
-            printf("ERROR: block starts above 0x%08lx\n", (unsigned long)new_base);
-            goto fail;
-        }
-    } else {
-        void *block_addr = sceKernelGetBlockHeadAddr(mem_block);
-        printf("Memory block at %p\n", block_addr);
+    void *game_mem = malloc(alloc_size);
+    if (!game_mem) {
+        printf("ERROR: malloc(%lu) failed\n", (unsigned long)alloc_size);
+        goto fail;
     }
+    uint32_t new_base = (uint32_t)game_mem;
+    printf("Game memory at 0x%08lx (%lu bytes)\n",
+           (unsigned long)new_base, (unsigned long)alloc_size);
 
-    /* ── Load and relocate ──────────────────────────────────────────────── */
+    /* ── Stream RAWD and relocate ──────────────────────────────────────── */
 
-    if (ccdl_load_relocated(&ccdl, app_data, reloc_data, reloc_size, new_base) < 0) {
+    if (ccdl_load_relocated_fd(&ccdl, app_fd, reloc_data, reloc_size, new_base) < 0) {
         printf("ERROR: relocation failed\n");
         goto fail;
     }
 
-    /* Free file buffers — code is now in the allocated block */
-    free(app_data);  app_data = NULL;
+    sceIoClose(app_fd); app_fd = -1;
     free(reloc_data); reloc_data = NULL;
 
     /* ── Patch imports ──────────────────────────────────────────────────── */
@@ -239,7 +227,7 @@ int main(int argc, char *argv[]) {
     return 0;
 
 fail:
-    if (app_data) free(app_data);
+    if (app_fd >= 0) sceIoClose(app_fd);
     if (reloc_data) free(reloc_data);
     printf("\nPress HOME to exit.\n");
     sceKernelSleepThread();

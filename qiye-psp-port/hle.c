@@ -27,6 +27,7 @@ static volatile int g_quit = 0;
 static uint32_t     g_buttons = 0;        /* current Dingoo-format button state */
 static uint64_t     g_start_time = 0;     /* microseconds at init */
 static uint32_t     g_frame_count = 0;
+static uint32_t     g_lcd_framebuf = LCD_FRAMEBUF; /* set by main after alloc */
 
 /* Audio */
 static int          g_audio_ch = -1;      /* PSP audio channel */
@@ -50,6 +51,7 @@ static uint32_t g_sem_next_addr = 0x08E00004;
 
 /* Base path for file I/O */
 static const char *g_base_path = "ms0:/PSP/GAME/VDINGOO/nand/";
+
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Helpers
@@ -254,7 +256,7 @@ static uint32_t hle_fsys_ferror(uint32_t fd) {
 /* ── LCD / Video ──────────────────────────────────────────────────────────── */
 
 static uint32_t hle_lcd_get_frame(void) {
-    return LCD_FRAMEBUF;
+    return g_lcd_framebuf;
 }
 
 static void hle_lcd_set_frame(uint32_t addr) {

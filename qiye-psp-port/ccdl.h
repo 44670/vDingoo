@@ -53,7 +53,7 @@ int ccdl_parse(const uint8_t *data, uint32_t size, CcdlBinary *ccdl);
  * and adjust all CCDL addresses.
  *
  * @param ccdl       Parsed CCDL binary (addresses will be updated in-place)
- * @param app_data   Raw .app file data
+ * @param app_data   Raw .app file data (full file, or NULL to use app_fd)
  * @param reloc_data Raw .reloc.bin file data
  * @param reloc_size Size of reloc data
  * @param new_base   Target load address (e.g. 0x08A00000)
@@ -61,6 +61,14 @@ int ccdl_parse(const uint8_t *data, uint32_t size, CcdlBinary *ccdl);
 int ccdl_load_relocated(CcdlBinary *ccdl, const uint8_t *app_data,
                         const uint8_t *reloc_data, uint32_t reloc_size,
                         uint32_t new_base);
+
+/**
+ * Stream RAWD from an open file descriptor directly into new_base,
+ * then apply relocations. For memory-constrained platforms (PSP).
+ */
+int ccdl_load_relocated_fd(CcdlBinary *ccdl, int app_fd,
+                           const uint8_t *reloc_data, uint32_t reloc_size,
+                           uint32_t new_base);
 
 /**
  * Patch each import stub with a J instruction to the corresponding HLE function.

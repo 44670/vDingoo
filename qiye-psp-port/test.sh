@@ -1,16 +1,15 @@
 #!/bin/bash
 #
-# Build, deploy to PPSSPP memstick, and run with stdio tracing.
-#
-# PSP homebrew printf() goes through Kernel sceIo syscalls — PPSSPP logs them
-# on the "sceKernel" / "HLE" channels. Use --log to capture all output.
+# Build, deploy to PPSSPP memstick, and run.
 #
 # Usage:
 #   ./test.sh          # build + run
 #   ./test.sh --run    # skip build, just run
-#   ./test.sh --log    # build + run with full log to file
 
 set -e
+
+export DISPLAY=:0
+export XAUTHORITY=$HOME/.Xauthority
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -45,7 +44,6 @@ cp "$SCRIPT_DIR/EBOOT.PBP" "$GAME_DIR/"
 for f in qiye.app qiye.reloc.bin; do
     src="$PROJECT_DIR/nand/$f"
     if [ ! -f "$src" ]; then
-        # Try project root
         src="$PROJECT_DIR/$f"
     fi
     if [ -f "$src" ]; then
@@ -56,12 +54,10 @@ for f in qiye.app qiye.reloc.bin; do
     fi
 done
 
-# Symlink the nand/ game assets directory (save files, PAK resources)
-# Only link content subdirs that exist in the project's nand/ dir
+# Symlink the nand/ game assets directory
 if [ -d "$PROJECT_DIR/nand" ]; then
     for item in "$PROJECT_DIR/nand"/*; do
         basename="$(basename "$item")"
-        # Skip the files we already copied
         [ "$basename" = "qiye.app" ] && continue
         [ "$basename" = "qiye.reloc.bin" ] && continue
         dest="$GAME_DIR/nand/$basename"
@@ -76,34 +72,11 @@ echo ""
 
 # ── Run PPSSPP ─────────────────────────────────────────────────────────────
 
-LOGFILE="$SCRIPT_DIR/ppsspp.log"
 EBOOT_PATH="$GAME_DIR/EBOOT.PBP"
 
+LOGFILE="$SCRIPT_DIR/ppsspp.log"
+
 echo "=== Running in PPSSPP ==="
-echo "EBOOT: $EBOOT_PATH"
-echo "Log:   $LOGFILE"
-echo ""
-
-# PPSSPP flags:
-#   -d           = debug log level (captures PSP printf via sceIo)
-#   --log=FILE   = write log to file
-#   --graphics=software  = no GPU required (headless-friendly)
-#
-# PSP printf output appears in log lines like:
-#   HLE: sceIoWrite(fd=1, ...) = "..."  (stdout)
-#   or in PPSSPP's "Kernel" log channel
-#
-# To view stdio in real-time, tail the log in another terminal:
-#   tail -f qiye-psp-port/ppsspp.log | grep -i "sceIo\|HLE\|printf\|stdout"
-
-if [ "$1" = "--log" ] || [ "$2" = "--log" ]; then
-    echo "(Logging to $LOGFILE — tail -f $LOGFILE in another terminal)"
-    echo ""
-    "$PPSSPP_BIN" "$EBOOT_PATH" -d --log="$LOGFILE" 2>&1 | tee -a "$LOGFILE"
-else
-    # Default: show output on terminal, also save to log
-    "$PPSSPP_BIN" "$EBOOT_PATH" -d 2>&1 | tee "$LOGFILE"
-fi
-
-echo ""
-echo "=== Done (exit code: $?) ==="
+echo "Log: $LOGFILE"
+killall PPSSPPSDL 2>/dev/null || true
+"$PPSSPP_BIN" "$EBOOT_PATH" "$@" >> "$LOGFILE" 2>&1
