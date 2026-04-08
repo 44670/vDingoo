@@ -71,7 +71,16 @@ fn main() {
     let canvas = window.into_canvas().accelerated().build().expect("Failed to create canvas");
     let event_pump = sdl_context.event_pump().expect("Failed to get event pump");
 
-    let mut sdl_state = SdlState { canvas, event_pump };
+    let creator = canvas.texture_creator();
+    let texture = creator
+        .create_texture_streaming(sdl2::pixels::PixelFormatEnum::RGB565, 320, 240)
+        .expect("Failed to create texture");
+    // Safety: creator is kept alive (leaked) for the program's lifetime.
+    // The texture references the creator's GPU context, so we must ensure it outlives the texture.
+    let texture: sdl2::render::Texture<'static> = unsafe { std::mem::transmute(texture) };
+    std::mem::forget(creator);
+
+    let mut sdl_state = SdlState { canvas, event_pump, texture };
 
     let mut cpu = Cpu::new();
     cpu.pc = ccdl.entry_point;
@@ -143,7 +152,7 @@ fn main() {
 fn run_until_sentinel(ctx: &mut EmuCtx, trace: bool, max_insns: u64) {
     loop {
         if ctx.cpu.insn_count >= max_insns {
-            eprintln!("\n[STOP] max instructions reached ({max_insns})");
+            eprintln!("\n[STOP] max instructions reached ({max_insns}) at PC=0x{:08x}", ctx.cpu.pc);
             break;
         }
         if ctx.hle.quit {

@@ -5,8 +5,7 @@ use crate::mips::Cpu;
 
 use sdl2::event::Event;
 use sdl2::keyboard::Scancode;
-use sdl2::pixels::PixelFormatEnum;
-use sdl2::render::Canvas;
+use sdl2::render::{Canvas, Texture};
 use sdl2::video::Window;
 use sdl2::EventPump;
 
@@ -17,6 +16,8 @@ use std::time::Instant;
 
 const HLE_BASE: u32 = 0x8000_0000;
 const LCD_FRAMEBUF: u32 = 0x80F0_0000;
+const LOCALE_ANSI_BUF: u32 = 0x8001_2000; // static buffer for __to_locale_ansi
+const UNICODE_LE_BUF: u32 = 0x8001_3000;  // static buffer for __to_unicode_le
 const LCD_W: u32 = 320;
 const LCD_H: u32 = 240;
 
@@ -55,7 +56,7 @@ pub struct HleState {
 pub struct SdlState {
     pub canvas: Canvas<Window>,
     pub event_pump: EventPump,
-    // texture stored separately due to lifetime issues with TextureCreator
+    pub texture: Texture<'static>,
 }
 
 /// Everything the HLE handlers need access to.
@@ -138,7 +139,8 @@ impl HleState {
                 "OSSemCreate" => hle_ossem_create,
                 "OSSemPend" => hle_ossem_pend,
                 "OSSemPost" | "OSSemDel" => hle_stub_zero,
-                "OSTimeGet" | "GetTickCount" => hle_get_tick,
+                "OSTimeGet" => hle_get_tick,
+                "GetTickCount" => hle_get_tick_ms,
                 "OSTimeDly" => hle_os_time_dly,
                 "OSTaskCreate" => hle_os_task_create,
                 "OSTaskDel" => hle_stub_zero,
@@ -352,31 +354,33 @@ fn hle_abort(_ctx: &mut EmuCtx) {
 
 fn hle_to_unicode_le(ctx: &mut EmuCtx) {
     // wchar_t* __to_unicode_le(char* src)
-    // Single arg: converts ANSI string in-place to UCS-2 LE, returns pointer
-    // Must work backwards to avoid overwriting source bytes
-    let addr = ctx.cpu.gpr(4);
-    let s = ctx.mem.read_string(addr);
-    let mut off = addr;
+    // Single arg: converts ANSI string to UCS-2 LE in a static buffer, returns pointer
+    let src = ctx.cpu.gpr(4);
+    let s = ctx.mem.read_string(src);
+    let buf = UNICODE_LE_BUF;
+    let mut off = buf;
     for b in s.bytes() {
         ctx.mem.write_u16(off, b as u16);
         off += 2;
     }
     ctx.mem.write_u16(off, 0);
-    ctx.cpu.set_gpr(2, addr);
+    ctx.cpu.set_gpr(2, buf);
 }
 
 fn hle_to_locale_ansi(ctx: &mut EmuCtx) {
     // char* __to_locale_ansi(wchar_t* src)
-    // Single arg: converts UCS-2 LE wide string in-place to ANSI, returns pointer
-    let addr = ctx.cpu.gpr(4);
-    let ws = GuestFs::read_wstring(ctx.mem, addr);
-    let mut off = addr;
+    // Single arg: converts UCS-2 LE wide string to ANSI in a static buffer, returns pointer
+    let src = ctx.cpu.gpr(4);
+    let ws = GuestFs::read_wstring(ctx.mem, src);
+    // Write to static scratch buffer (not in-place — caller may call twice with same src)
+    let buf = LOCALE_ANSI_BUF;
+    let mut off = buf;
     for b in ws.bytes() {
         ctx.mem.write_u8(off, b);
         off += 1;
     }
     ctx.mem.write_u8(off, 0);
-    ctx.cpu.set_gpr(2, addr);
+    ctx.cpu.set_gpr(2, buf);
 }
 
 // ── Filesystem ──────────────────────────────────────────────────────────────
@@ -482,16 +486,11 @@ fn present_framebuffer(ctx: &mut EmuCtx) {
     let fb_size = (LCD_W * LCD_H * 2) as usize;
     let fb_data = ctx.mem.slice(LCD_FRAMEBUF, fb_size);
 
-    let creator = ctx.sdl.canvas.texture_creator();
-    let mut texture = creator
-        .create_texture_streaming(PixelFormatEnum::RGB565, LCD_W, LCD_H)
-        .expect("Failed to create texture");
-
-    texture
+    ctx.sdl.texture
         .update(None, fb_data, (LCD_W * 2) as usize)
         .expect("Failed to update texture");
 
-    ctx.sdl.canvas.copy(&texture, None, None).expect("Failed to copy texture");
+    ctx.sdl.canvas.copy(&ctx.sdl.texture, None, None).expect("Failed to copy texture");
     ctx.sdl.canvas.present();
 }
 
@@ -539,6 +538,7 @@ fn hle_sys_judge_event(ctx: &mut EmuCtx) {
 }
 
 fn hle_kbd_get_status(ctx: &mut EmuCtx) {
+    poll_sdl_input(ctx);
     let out_ptr = ctx.cpu.gpr(4);
     // 12-byte struct: u32 field0, u32 field1, u32 buttons
     // Game's input_dispatch reads buttons from offset 8 and does its own prev tracking
@@ -572,10 +572,18 @@ fn hle_ossem_pend(ctx: &mut EmuCtx) {
 }
 
 fn hle_get_tick(ctx: &mut EmuCtx) {
-    // 100Hz tick rate: elapsed_ms / 10
+    // OSTimeGet: 100Hz tick rate (10ms per tick)
     let elapsed = ctx.hle.start_time.elapsed();
     let ticks = (elapsed.as_millis() / 10) as u32;
     ctx.cpu.set_gpr(2, ticks);
+}
+
+fn hle_get_tick_ms(ctx: &mut EmuCtx) {
+    // GetTickCount: returns milliseconds
+    // Use instruction count to ensure time advances even in tight polling loops
+    // ~1M insns/sec on original hardware → 1 insn ≈ 1µs → 1000 insns ≈ 1ms
+    let ms = (ctx.cpu.insn_count / 1000) as u32;
+    ctx.cpu.set_gpr(2, ms);
 }
 
 fn hle_os_time_dly(ctx: &mut EmuCtx) {
