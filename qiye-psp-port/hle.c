@@ -213,12 +213,21 @@ static uint32_t hle_fsys_fopenW(const uint16_t *wpath, const uint16_t *wmode) {
 static uint32_t hle_fsys_fread(void *buf, uint32_t size, uint32_t count, uint32_t fd) {
     uint32_t total = size * count;
     void *ra0 = __builtin_return_address(0);
-    void *ra1 = __builtin_return_address(1);
-    printf("[HLE] fread(buf=%p,sz=%lu,n=%lu,fd=0x%lx,total=%lu) ra=%p ra2=%p\n",buf,(unsigned long)size,(unsigned long)count,(unsigned long)fd,(unsigned long)total,ra0,ra1);
+    printf("[HLE] fread(buf=%p,sz=%lu,n=%lu,fd=0x%lx,total=%lu) ra=%p\n",buf,(unsigned long)size,(unsigned long)count,(unsigned long)fd,(unsigned long)total,ra0);
     int idx = find_fd(fd);
     if (idx < 0) { printf("[HLE] fread: bad fd!\n"); return 0; }
     int n = sceIoRead(g_files[idx], buf, total);
     printf("[HLE] fread: sceIoRead=%d\n", n);
+    if (n == 8336) {
+        /* Dump stack to find callers */
+        uint32_t sp;
+        __asm__ volatile("move %0, $sp" : "=r"(sp));
+        uint32_t *stk = (uint32_t *)sp;
+        printf("[STK] sp=%p\n", (void *)sp);
+        for (int si = 0; si < 32; si++) {
+            printf("[STK] +%02x: %08lx\n", si*4, (unsigned long)stk[si]);
+        }
+    }
     if (n < 0) return 0;
     if ((uint32_t)n < total) g_file_eof[idx] = 1;
     return (size > 0) ? ((uint32_t)n / size) : 0;

@@ -165,16 +165,23 @@ int main(int argc, char *argv[]) {
 
     /* ── Allocate memory for game code+data+trampolines ─────────────────── */
 
-    /* Align to 64KB so delta & 0xFFFF == 0 (required for LO16 relocs) */
+    /* Fixed load address — 300KB RWX buffer placed at 0x08A00000 via
+     * --section-start. 64KB aligned for LO16 relocs. Deterministic across
+     * PPSSPP / real PSP / Vita Adrenaline. */
+    static uint8_t game_buf[2 * 1024 * 1024] __attribute__((section(".game_buf")));
     uint32_t alloc_size = rawd_size > ccdl.memory_size ? rawd_size : ccdl.memory_size;
-    void *game_raw = malloc(alloc_size + 0x10000);
-    if (!game_raw) {
-        printf("ERROR: malloc(%lu) failed\n", (unsigned long)(alloc_size + 0x10000));
+    uint32_t new_base = (uint32_t)game_buf;
+    printf("Game buffer at 0x%08lx (%lu bytes, need %lu)\n",
+           (unsigned long)new_base, (unsigned long)sizeof(game_buf), (unsigned long)alloc_size);
+    if (new_base != 0x08A00000) {
+        printf("ERROR: game_buf not at 0x08A00000! Got 0x%08lx\n", (unsigned long)new_base);
         goto fail;
     }
-    uint32_t new_base = ((uint32_t)game_raw + 0xFFFF) & ~0xFFFF;
-    printf("Game memory at 0x%08lx (%lu bytes)\n",
-           (unsigned long)new_base, (unsigned long)alloc_size);
+    if (alloc_size > sizeof(game_buf)) {
+        printf("ERROR: game needs %lu but buffer is %lu!\n",
+               (unsigned long)alloc_size, (unsigned long)sizeof(game_buf));
+        goto fail;
+    }
 
     /* ── Load patched RAWD and relocate ────────────────────────────────── */
 
@@ -234,7 +241,6 @@ int main(int argc, char *argv[]) {
 
     /* ── Cleanup ────────────────────────────────────────────────────────── */
 
-    free(game_raw);
     free(ccdl.imports);
     free(ccdl.exports);
     sceKernelExitGame();
