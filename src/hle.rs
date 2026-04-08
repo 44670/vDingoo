@@ -166,7 +166,11 @@ impl HleState {
                 "USB_Connect" | "USB_No_Connect" | "udc_attached" => hle_stub_zero,
                 "serial_putc" | "serial_getc" => hle_stub_zero,
 
-                _ => hle_default,
+                _ => {
+                    eprintln!("[HLE] WARNING: unknown import '{}' at 0x{:08x} — will return 0",
+                        imp.name, imp.target_vaddr);
+                    hle_default
+                }
             };
 
             state.handlers.push(handler);
@@ -567,7 +571,7 @@ fn hle_ossem_pend(ctx: &mut EmuCtx) {
     // OSSemPend(sem, timeout, &err)
     let err_ptr = ctx.cpu.gpr(6);
     if err_ptr != 0 {
-        ctx.mem.write_u8(err_ptr, 0); // OS_ERR_NONE
+        ctx.mem.write_u32(err_ptr, 0); // OS_ERR_NONE
     }
 }
 
@@ -620,6 +624,8 @@ fn read_vararg(cpu: &Cpu, mem: &Memory, arg_index: usize) -> u32 {
     }
 }
 
+/// Format a C-style printf string using guest memory and CPU register state.
+/// `first_arg` is the vararg slot index of the first format argument (e.g. 1 for sprintf, 2 for snprintf).
 fn format_guest_string(mem: &Memory, cpu: &Cpu, fmt_addr: u32, first_arg: usize) -> String {
     let fmt = mem.read_string(fmt_addr);
     let mut result = String::new();
@@ -634,31 +640,420 @@ fn format_guest_string(mem: &Memory, cpu: &Cpu, fmt_addr: u32, first_arg: usize)
         match chars.peek() {
             Some('%') => { chars.next(); result.push('%'); }
             _ => {
-                while matches!(chars.peek(), Some('-' | '+' | ' ' | '0' | '#')) { chars.next(); }
-                while matches!(chars.peek(), Some('0'..='9')) { chars.next(); }
-                if matches!(chars.peek(), Some('.')) {
-                    chars.next();
-                    while matches!(chars.peek(), Some('0'..='9')) { chars.next(); }
+                // Flags
+                let mut flag_minus = false;
+                let mut flag_zero = false;
+                let mut flag_plus = false;
+                let mut flag_space = false;
+                let mut flag_hash = false;
+                loop {
+                    match chars.peek() {
+                        Some('-') => { flag_minus = true; chars.next(); }
+                        Some('0') => { flag_zero = true; chars.next(); }
+                        Some('+') => { flag_plus = true; chars.next(); }
+                        Some(' ') => { flag_space = true; chars.next(); }
+                        Some('#') => { flag_hash = true; chars.next(); }
+                        _ => break,
+                    }
                 }
-                while matches!(chars.peek(), Some('l' | 'h' | 'z')) { chars.next(); }
 
-                let val = read_vararg(cpu, mem, arg_idx);
-                arg_idx += 1;
+                // Width (* or digits)
+                let width: Option<usize> = if matches!(chars.peek(), Some('*')) {
+                    chars.next();
+                    let w = read_vararg(cpu, mem, arg_idx) as i32;
+                    arg_idx += 1;
+                    if w < 0 { flag_minus = true; Some((-w) as usize) }
+                    else { Some(w as usize) }
+                } else {
+                    let mut w = String::new();
+                    while matches!(chars.peek(), Some('0'..='9')) { w.push(chars.next().unwrap()); }
+                    w.parse().ok()
+                };
 
-                match chars.next() {
-                    Some('d' | 'i') => result.push_str(&format!("{}", val as i32)),
-                    Some('u') => result.push_str(&format!("{}", val)),
-                    Some('x') => result.push_str(&format!("{:x}", val)),
-                    Some('X') => result.push_str(&format!("{:X}", val)),
-                    Some('o') => result.push_str(&format!("{:o}", val)),
-                    Some('c') => result.push(char::from(val as u8)),
-                    Some('s') => result.push_str(&mem.read_string(val)),
-                    Some('p') => result.push_str(&format!("0x{:08x}", val)),
-                    Some(other) => { result.push('%'); result.push(other); }
-                    None => result.push('%'),
+                // Precision
+                let precision: Option<usize> = if matches!(chars.peek(), Some('.')) {
+                    chars.next();
+                    if matches!(chars.peek(), Some('*')) {
+                        chars.next();
+                        let p = read_vararg(cpu, mem, arg_idx) as i32;
+                        arg_idx += 1;
+                        Some(p.max(0) as usize)
+                    } else {
+                        let mut p = String::new();
+                        while matches!(chars.peek(), Some('0'..='9')) { p.push(chars.next().unwrap()); }
+                        Some(p.parse().unwrap_or(0))
+                    }
+                } else {
+                    None
+                };
+
+                // Length modifier
+                while matches!(chars.peek(), Some('l' | 'h' | 'z' | 'j' | 't')) { chars.next(); }
+
+                // Format the raw value (no padding yet)
+                // Don't pre-read val — %f needs two slots with alignment
+                let (raw, is_negative) = match chars.next() {
+                    Some('d' | 'i') => {
+                        let v = read_vararg(cpu, mem, arg_idx) as i32;
+                        arg_idx += 1;
+                        (format!("{}", v.abs()), v < 0)
+                    }
+                    Some('u') => {
+                        let v = read_vararg(cpu, mem, arg_idx);
+                        arg_idx += 1;
+                        (format!("{}", v), false)
+                    }
+                    Some('x') => {
+                        let v = read_vararg(cpu, mem, arg_idx);
+                        arg_idx += 1;
+                        let s = format!("{:x}", v);
+                        (if flag_hash && v != 0 { format!("0x{s}") } else { s }, false)
+                    }
+                    Some('X') => {
+                        let v = read_vararg(cpu, mem, arg_idx);
+                        arg_idx += 1;
+                        let s = format!("{:X}", v);
+                        (if flag_hash && v != 0 { format!("0X{s}") } else { s }, false)
+                    }
+                    Some('o') => {
+                        let v = read_vararg(cpu, mem, arg_idx);
+                        arg_idx += 1;
+                        let s = format!("{:o}", v);
+                        (if flag_hash && v != 0 { format!("0{s}") } else { s }, false)
+                    }
+                    Some('c') => {
+                        let v = read_vararg(cpu, mem, arg_idx);
+                        arg_idx += 1;
+                        (String::from(char::from(v as u8)), false)
+                    }
+                    Some('s') => {
+                        let v = read_vararg(cpu, mem, arg_idx);
+                        arg_idx += 1;
+                        let mut s = mem.read_string(v);
+                        if let Some(prec) = precision {
+                            s.truncate(prec);
+                        }
+                        (s, false)
+                    }
+                    Some('p') => {
+                        let v = read_vararg(cpu, mem, arg_idx);
+                        arg_idx += 1;
+                        (format!("0x{:08x}", v), false)
+                    }
+                    Some('f' | 'e' | 'g') => {
+                        // MIPS o32: doubles are aligned to even-numbered arg slots
+                        if arg_idx % 2 != 0 { arg_idx += 1; }
+                        let lo = read_vararg(cpu, mem, arg_idx);
+                        let hi = read_vararg(cpu, mem, arg_idx + 1);
+                        arg_idx += 2;
+                        let bits = ((hi as u64) << 32) | (lo as u64);
+                        let fval = f64::from_bits(bits);
+                        let prec = precision.unwrap_or(6);
+                        let neg = fval < 0.0;
+                        (format!("{:.prec$}", fval.abs()), neg)
+                    }
+                    Some(other) => { result.push('%'); result.push(other); continue; }
+                    None => { result.push('%'); continue; }
+                };
+
+                // Build final padded string
+                let sign = if is_negative { "-" }
+                    else if flag_plus { "+" }
+                    else if flag_space { " " }
+                    else { "" };
+
+                let content = format!("{sign}{raw}");
+                let w = width.unwrap_or(0);
+                if content.len() >= w {
+                    result.push_str(&content);
+                } else {
+                    let pad = w - content.len();
+                    if flag_minus {
+                        // left-align
+                        result.push_str(&content);
+                        for _ in 0..pad { result.push(' '); }
+                    } else if flag_zero {
+                        // zero-pad: sign then zeros then digits
+                        result.push_str(sign);
+                        for _ in 0..pad { result.push('0'); }
+                        result.push_str(&raw);
+                    } else {
+                        // right-align with spaces
+                        for _ in 0..pad { result.push(' '); }
+                        result.push_str(&content);
+                    }
                 }
             }
         }
     }
     result
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::Memory;
+    use crate::mips::Cpu;
+
+    const FMT_ADDR: u32 = 0x8002_0000;
+    const STR_ADDR: u32 = 0x8002_1000;
+
+    /// Set up CPU + Memory with a format string and up to 8 varargs.
+    /// Returns the formatted result using first_arg=0 (args start at $a0).
+    fn fmt(format: &str, args: &[u32]) -> String {
+        let mut mem = Memory::new();
+        let mut cpu = Cpu::new();
+        cpu.set_gpr(29, 0x8001_0000); // $sp
+
+        // Write format string
+        for (i, b) in format.bytes().enumerate() {
+            mem.write_u8(FMT_ADDR + i as u32, b);
+        }
+        mem.write_u8(FMT_ADDR + format.len() as u32, 0);
+
+        // Set args: $a0..$a3 then stack
+        for (i, &val) in args.iter().enumerate() {
+            match i {
+                0 => cpu.set_gpr(4, val),
+                1 => cpu.set_gpr(5, val),
+                2 => cpu.set_gpr(6, val),
+                3 => cpu.set_gpr(7, val),
+                _ => {
+                    let sp = cpu.gpr(29);
+                    mem.write_u32(sp + 16 + ((i - 4) as u32) * 4, val);
+                }
+            }
+        }
+
+        format_guest_string(&mem, &cpu, FMT_ADDR, 0)
+    }
+
+    /// Helper: write a C string to guest memory, return its address.
+    fn fmt_with_str(format: &str, s: &str, args: &[u32]) -> String {
+        let mut mem = Memory::new();
+        let mut cpu = Cpu::new();
+        cpu.set_gpr(29, 0x8001_0000);
+
+        // Write format string
+        for (i, b) in format.bytes().enumerate() {
+            mem.write_u8(FMT_ADDR + i as u32, b);
+        }
+        mem.write_u8(FMT_ADDR + format.len() as u32, 0);
+
+        // Write the string argument
+        for (i, b) in s.bytes().enumerate() {
+            mem.write_u8(STR_ADDR + i as u32, b);
+        }
+        mem.write_u8(STR_ADDR + s.len() as u32, 0);
+
+        // Build full args list with STR_ADDR replacing the first arg
+        let mut full_args = vec![STR_ADDR];
+        full_args.extend_from_slice(args);
+
+        for (i, &val) in full_args.iter().enumerate() {
+            match i {
+                0 => cpu.set_gpr(4, val),
+                1 => cpu.set_gpr(5, val),
+                2 => cpu.set_gpr(6, val),
+                3 => cpu.set_gpr(7, val),
+                _ => {
+                    let sp = cpu.gpr(29);
+                    mem.write_u32(sp + 16 + ((i - 4) as u32) * 4, val);
+                }
+            }
+        }
+
+        format_guest_string(&mem, &cpu, FMT_ADDR, 0)
+    }
+
+    #[test]
+    fn test_sprintf_plain_text() {
+        assert_eq!(fmt("hello world", &[]), "hello world");
+    }
+
+    #[test]
+    fn test_sprintf_percent_escape() {
+        assert_eq!(fmt("100%%", &[]), "100%");
+    }
+
+    #[test]
+    fn test_sprintf_decimal() {
+        assert_eq!(fmt("%d", &[42]), "42");
+        assert_eq!(fmt("%d", &[(-1i32) as u32]), "-1");
+        assert_eq!(fmt("%d", &[0]), "0");
+    }
+
+    #[test]
+    fn test_sprintf_unsigned() {
+        assert_eq!(fmt("%u", &[42]), "42");
+        assert_eq!(fmt("%u", &[0xFFFF_FFFF]), "4294967295");
+    }
+
+    #[test]
+    fn test_sprintf_hex() {
+        assert_eq!(fmt("%x", &[0xFF]), "ff");
+        assert_eq!(fmt("%X", &[0xFF]), "FF");
+        assert_eq!(fmt("%x", &[0]), "0");
+    }
+
+    #[test]
+    fn test_sprintf_octal() {
+        assert_eq!(fmt("%o", &[8]), "10");
+        assert_eq!(fmt("%o", &[0]), "0");
+    }
+
+    #[test]
+    fn test_sprintf_char() {
+        assert_eq!(fmt("%c", &[65]), "A");
+    }
+
+    #[test]
+    fn test_sprintf_pointer() {
+        assert_eq!(fmt("%p", &[0x80A0_0000]), "0x80a00000");
+    }
+
+    #[test]
+    fn test_sprintf_string() {
+        assert_eq!(fmt_with_str("%s", "hello", &[]), "hello");
+    }
+
+    // ── Width / padding ────────────────────────────────────────────────
+
+    #[test]
+    fn test_sprintf_width_right_align() {
+        assert_eq!(fmt("%5d", &[42]), "   42");
+        assert_eq!(fmt("%10d", &[(-1i32) as u32]), "        -1");
+    }
+
+    #[test]
+    fn test_sprintf_width_left_align() {
+        assert_eq!(fmt("%-5d", &[42]), "42   ");
+    }
+
+    #[test]
+    fn test_sprintf_zero_pad() {
+        assert_eq!(fmt("%04x", &[0xA]), "000a");
+        assert_eq!(fmt("%08X", &[0xDEAD]), "0000DEAD");
+        assert_eq!(fmt("%05d", &[42]), "00042");
+    }
+
+    #[test]
+    fn test_sprintf_zero_pad_negative() {
+        assert_eq!(fmt("%06d", &[(-42i32) as u32]), "-00042");
+    }
+
+    // ── Flags ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sprintf_plus_flag() {
+        assert_eq!(fmt("%+d", &[42]), "+42");
+        assert_eq!(fmt("%+d", &[(-42i32) as u32]), "-42");
+    }
+
+    #[test]
+    fn test_sprintf_space_flag() {
+        assert_eq!(fmt("% d", &[42]), " 42");
+        assert_eq!(fmt("% d", &[(-42i32) as u32]), "-42");
+    }
+
+    #[test]
+    fn test_sprintf_hash_flag() {
+        assert_eq!(fmt("%#x", &[0xFF]), "0xff");
+        assert_eq!(fmt("%#X", &[0xFF]), "0XFF");
+        assert_eq!(fmt("%#o", &[8]), "010");
+        // # with zero value: no prefix
+        assert_eq!(fmt("%#x", &[0]), "0");
+    }
+
+    // ── Precision ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sprintf_string_precision() {
+        assert_eq!(fmt_with_str("%.3s", "hello", &[]), "hel");
+        assert_eq!(fmt_with_str("%.10s", "hi", &[]), "hi");
+    }
+
+    // ── Multiple args ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_sprintf_multiple_args() {
+        assert_eq!(fmt("%d + %d = %d", &[1, 2, 3]), "1 + 2 = 3");
+    }
+
+    #[test]
+    fn test_sprintf_mixed_types() {
+        assert_eq!(fmt("%d 0x%04x", &[255, 255]), "255 0x00ff");
+    }
+
+    // ── Float ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sprintf_float() {
+        let bits = f64::to_bits(3.14);
+        let lo = bits as u32;
+        let hi = (bits >> 32) as u32;
+        // %f with even-aligned args: arg0=lo, arg1=hi
+        assert_eq!(fmt("%f", &[lo, hi]), "3.140000");
+    }
+
+    #[test]
+    fn test_sprintf_float_precision() {
+        let bits = f64::to_bits(3.14159);
+        let lo = bits as u32;
+        let hi = (bits >> 32) as u32;
+        assert_eq!(fmt("%.2f", &[lo, hi]), "3.14");
+    }
+
+    #[test]
+    fn test_sprintf_float_negative() {
+        let bits = f64::to_bits(-1.5);
+        let lo = bits as u32;
+        let hi = (bits >> 32) as u32;
+        assert_eq!(fmt("%f", &[lo, hi]), "-1.500000");
+    }
+
+    #[test]
+    fn test_sprintf_float_alignment() {
+        // If first arg is an int, float should align to even slot
+        // %d consumes slot 0, then %f should skip slot 1, use slots 2+3
+        let bits = f64::to_bits(2.5);
+        let lo = bits as u32;
+        let hi = (bits >> 32) as u32;
+        assert_eq!(fmt("%d %f", &[42, 0xDEAD, lo, hi]), "42 2.500000");
+    }
+
+    // ── Star width/precision ───────────────────────────────────────────
+
+    #[test]
+    fn test_sprintf_star_width() {
+        assert_eq!(fmt("%*d", &[5, 42]), "   42");
+    }
+
+    #[test]
+    fn test_sprintf_star_precision() {
+        // %.*s: arg0 = precision (3), arg1 = string pointer
+        let mut mem = Memory::new();
+        let mut cpu = Cpu::new();
+        cpu.set_gpr(29, 0x8001_0000);
+        for (i, b) in b"%.*s".iter().enumerate() {
+            mem.write_u8(FMT_ADDR + i as u32, *b);
+        }
+        mem.write_u8(FMT_ADDR + 4, 0);
+        for (i, b) in b"hello".iter().enumerate() {
+            mem.write_u8(STR_ADDR + i as u32, *b);
+        }
+        mem.write_u8(STR_ADDR + 5, 0);
+        cpu.set_gpr(4, 3);        // precision
+        cpu.set_gpr(5, STR_ADDR); // string
+        assert_eq!(format_guest_string(&mem, &cpu, FMT_ADDR, 0), "hel");
+    }
+
+    // ── Width smaller than value (no truncation) ───────────────────────
+
+    #[test]
+    fn test_sprintf_width_no_truncate() {
+        assert_eq!(fmt("%2d", &[12345]), "12345");
+    }
 }

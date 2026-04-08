@@ -28,6 +28,9 @@ fn main() {
     }
 
     let app_path = &args[1];
+    if !app_path.starts_with("nand/") {
+        panic!("app path must begin with \"nand/\": {app_path}");
+    }
     let trace = args.iter().any(|a| a == "--trace");
     let max_insns: u64 = args
         .iter()
