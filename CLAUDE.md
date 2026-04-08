@@ -2,6 +2,11 @@
 
 Rust user-space HLE emulator for **Dingoo A320** native apps (`.app` / CCDL format).
 
+
+# IMPORTANT
+
+Run with DISPLAY=:0
+
 ## Goal
 
 Run Dingoo A320 `.app` binaries on desktop by emulating the MIPS32 CPU in
@@ -59,6 +64,5 @@ These are the OS/SDK functions that `.app` binaries call. Each must be stubbed:
 - Use Binary Ninja MCP tools to reverse-engineer `.app` binaries and discover
   undocumented SDK behavior
 - Use `app2elf.py` to produce ELF files with symbols for better analysis
-- The Dingoo A320 uses an Actions Semiconductor SoC (not Ingenic JZ4740), but
-  `qemu-JZ` is the closest reference for MIPS32R2 SoC emulation patterns
+- The Dingoo A320 uses  Ingenic JZ4740
 - CCDL apps run in KSEG0 (0x80000000+), cached, unmapped virtual addresses

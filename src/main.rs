@@ -229,6 +229,16 @@ fn run_until_sentinel(ctx: &mut EmuCtx, trace: bool, max_insns: u64) {
         let pre_pc = ctx.cpu.pc;
         match ctx.cpu.step(ctx.mem) {
             StepResult::Ok => {
+                // Audio watchpoints — key audio functions
+                match pre_pc {
+                    0x80a47dbc => eprintln!("[WATCH] AudioDevice_playChannel, ra=0x{:08x} a0=0x{:08x} a1=0x{:08x}", ctx.cpu.gpr(31), ctx.cpu.gpr(4), ctx.cpu.gpr(5)),
+                    0x80a77dcc => eprintln!("[WATCH] SoundManager_assignChannel, ra=0x{:08x}", ctx.cpu.gpr(31)),
+                    0x80a77a18 => eprintln!("[WATCH] AudioData_decompressADPCM, ra=0x{:08x}", ctx.cpu.gpr(31)),
+                    0x80a77b00 => eprintln!("[WATCH] SoundManager_init, ra=0x{:08x}", ctx.cpu.gpr(31)),
+                    0x80a3d2f0 => eprintln!("[WATCH] Scene_loadDay, a0=0x{:08x} a1=0x{:08x}", ctx.cpu.gpr(4), ctx.cpu.gpr(5)),
+                    0x80a3d538 => eprintln!("[WATCH] Scene_loadEpisode"),
+                    _ => {}
+                }
                 if trace {
                     let insn = ctx.mem.read_u32(pre_pc);
                     eprintln!("[{:08}] {:08x}: {:08x}", ctx.cpu.insn_count, pre_pc, insn);

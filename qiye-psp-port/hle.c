@@ -16,8 +16,11 @@
 
 #include <pspkernel.h>
 #include <pspdisplay.h>
+#include <pspdebug.h>
 #include <pspctrl.h>
 #include <pspaudio.h>
+
+#define printf pspDebugScreenPrintf
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Global state
@@ -156,6 +159,18 @@ static int find_sem(uint32_t guest_addr) {
 /* strlen: guest pointer is a real C string */
 /* strncasecmp: same */
 
+static void *hle_malloc(size_t size) {
+    void *p = malloc(size);
+    if (!p) printf("[HLE] malloc(%lu) FAILED!\n", (unsigned long)size);
+    return p;
+}
+
+static void *hle_realloc(void *ptr, size_t size) {
+    void *p = realloc(ptr, size);
+    if (!p && size) printf("[HLE] realloc(%lu) FAILED!\n", (unsigned long)size);
+    return p;
+}
+
 static void hle_abort_impl(void) {
     printf("[HLE] abort() called\n");
     sceKernelExitGame();
@@ -164,11 +179,13 @@ static void hle_abort_impl(void) {
 /* ── Filesystem ───────────────────────────────────────────────────────────── */
 
 static uint32_t hle_fsys_fopen(const char *path, const char *mode) {
+    printf("[FS] fopen(%s, %s)\n", path, mode);
     const char *host_path = translate_path(path);
-    if (!host_path) return 0;
-
+    if (!host_path) { printf("[FS] path blocked\n"); return 0; }
+    printf("[FS] -> %s\n", host_path);
     int flags = mode_to_flags(mode);
     SceUID fd = sceIoOpen(host_path, flags, 0777);
+    printf("[FS] sceIoOpen = 0x%08x\n", fd);
     if (fd < 0) return 0;
 
     /* Find free slot */
@@ -183,6 +200,7 @@ static uint32_t hle_fsys_fopen(const char *path, const char *mode) {
 }
 
 static uint32_t hle_fsys_fopenW(const uint16_t *wpath, const uint16_t *wmode) {
+    printf("[HLE] fsys_fopenW\n");
     const char *path = read_wstring(wpath);
     char mode_buf[16];
     /* Read mode wstring separately */
@@ -193,16 +211,21 @@ static uint32_t hle_fsys_fopenW(const uint16_t *wpath, const uint16_t *wmode) {
 }
 
 static uint32_t hle_fsys_fread(void *buf, uint32_t size, uint32_t count, uint32_t fd) {
-    int idx = find_fd(fd);
-    if (idx < 0) return 0;
     uint32_t total = size * count;
+    void *ra0 = __builtin_return_address(0);
+    void *ra1 = __builtin_return_address(1);
+    printf("[HLE] fread(buf=%p,sz=%lu,n=%lu,fd=0x%lx,total=%lu) ra=%p ra2=%p\n",buf,(unsigned long)size,(unsigned long)count,(unsigned long)fd,(unsigned long)total,ra0,ra1);
+    int idx = find_fd(fd);
+    if (idx < 0) { printf("[HLE] fread: bad fd!\n"); return 0; }
     int n = sceIoRead(g_files[idx], buf, total);
+    printf("[HLE] fread: sceIoRead=%d\n", n);
     if (n < 0) return 0;
     if ((uint32_t)n < total) g_file_eof[idx] = 1;
     return (size > 0) ? ((uint32_t)n / size) : 0;
 }
 
 static uint32_t hle_fsys_fwrite(const void *buf, uint32_t size, uint32_t count, uint32_t fd) {
+    printf("[HLE] fsys_fwrite\n");
     int idx = find_fd(fd);
     if (idx < 0) return 0;
     uint32_t total = size * count;
@@ -212,6 +235,7 @@ static uint32_t hle_fsys_fwrite(const void *buf, uint32_t size, uint32_t count, 
 }
 
 static uint32_t hle_fsys_fclose(uint32_t fd) {
+    printf("[HLE] fsys_fclose(0x%lx)\n",(unsigned long)fd);
     int idx = find_fd(fd);
     if (idx < 0) return (uint32_t)-1;
     sceIoClose(g_files[idx]);
@@ -220,6 +244,7 @@ static uint32_t hle_fsys_fclose(uint32_t fd) {
 }
 
 static uint32_t hle_fsys_fseek(uint32_t fd, int32_t offset, uint32_t whence) {
+    printf("[HLE] fsys_fseek(fd=0x%lx,off=%ld,w=%lu) ra=%p\n",(unsigned long)fd,(long)offset,(unsigned long)whence,__builtin_return_address(0));
     int idx = find_fd(fd);
     if (idx < 0) return (uint32_t)-1;
     int psp_whence;
@@ -236,6 +261,8 @@ static uint32_t hle_fsys_fseek(uint32_t fd, int32_t offset, uint32_t whence) {
 }
 
 static uint32_t hle_fsys_ftell(uint32_t fd) {
+    void *ra = __builtin_return_address(0);
+    printf("[HLE] fsys_ftell ra=%p\n", ra);
     int idx = find_fd(fd);
     if (idx < 0) return 0;
     SceOff pos = sceIoLseek(g_files[idx], 0, PSP_SEEK_CUR);
@@ -243,6 +270,7 @@ static uint32_t hle_fsys_ftell(uint32_t fd) {
 }
 
 static uint32_t hle_fsys_feof(uint32_t fd) {
+    printf("[HLE] fsys_feof\n");
     int idx = find_fd(fd);
     if (idx < 0) return 1;
     return g_file_eof[idx];
@@ -256,11 +284,13 @@ static uint32_t hle_fsys_ferror(uint32_t fd) {
 /* ── LCD / Video ──────────────────────────────────────────────────────────── */
 
 static uint32_t hle_lcd_get_frame(void) {
+    printf("[HLE] lcd_get_frame -> 0x%08x\n", (unsigned)g_framebuf);
     return (uint32_t)g_framebuf;
 }
 
 static void hle_lcd_set_frame(uint32_t addr) {
     (void)addr;
+    printf("[HLE] lcd_set_frame\n");
     /* Copy 320x240 RGB565 from guest framebuffer to PSP VRAM, centered */
     const uint16_t *src = g_framebuf;
     uint16_t *dst = (uint16_t *)PSP_VRAM_BASE;
@@ -268,11 +298,24 @@ static void hle_lcd_set_frame(uint32_t addr) {
     /* Offset to center: y*stride + x */
     dst += FB_Y_OFF * PSP_BUF_W + FB_X_OFF;
 
+    /* Dingoo uses RGB565 (R=15:11, B=4:0), PSP uses BGR565 (B=15:11, R=4:0) — swap R↔B */
     for (int y = 0; y < LCD_H; y++) {
-        memcpy(dst, src, LCD_W * 2);
+        for (int x = 0; x < LCD_W; x++) {
+            uint16_t px = src[x];
+            uint16_t r = (px >> 11) & 0x1F;
+            uint16_t g = (px >>  5) & 0x3F;
+            uint16_t b = (px      ) & 0x1F;
+            dst[x] = (b << 11) | (g << 5) | r;
+        }
         src += LCD_W;
         dst += PSP_BUF_W;
     }
+
+    /* Tell display hardware to show our buffer */
+    sceDisplaySetFrameBuf((void *)0x04000000, PSP_BUF_W,
+                          PSP_DISPLAY_PIXEL_FORMAT_565,
+                          PSP_DISPLAY_SETBUF_NEXTVSYNC);
+    sceDisplayWaitVblankStart();
 
     g_frame_count++;
     if (g_frame_count <= 3 || (g_frame_count % 60) == 0) {
@@ -311,6 +354,7 @@ static void poll_input(void) {
 }
 
 static void hle_kbd_get_status(uint32_t *out_ptr) {
+    printf("[HLE] kbd_get_status\n");
     poll_input();
     out_ptr[0] = 0;         /* field0 (unused) */
     out_ptr[1] = 0;         /* field1 (unused) */
@@ -318,32 +362,38 @@ static void hle_kbd_get_status(uint32_t *out_ptr) {
 }
 
 static uint32_t hle_kbd_get_key(void) {
+    printf("[HLE] kbd_get_key\n");
     return g_buttons;
 }
 
 static uint32_t hle_sys_judge_event(void) {
+    printf("[HLE] sys_judge_event\n");
     poll_input();
     return g_quit ? (uint32_t)-1 : 0;
 }
 
 static uint32_t hle_get_game_vol(void) {
+    printf("[HLE] get_game_vol\n");
     return 80;
 }
 
 /* ── OS / RTOS ────────────────────────────────────────────────────────────── */
 
 static uint32_t hle_OSTimeGet(void) {
+    printf("[HLE] OSTimeGet\n");
     /* 100Hz tick rate: 10ms per tick */
     uint64_t elapsed = get_time_us() - g_start_time;
     return (uint32_t)(elapsed / 10000);
 }
 
 static uint32_t hle_GetTickCount(void) {
+    printf("[HLE] GetTickCount\n");
     uint64_t elapsed = get_time_us() - g_start_time;
     return (uint32_t)(elapsed / 1000);
 }
 
 static void hle_OSTimeDly(uint32_t ticks) {
+    printf("[HLE] OSTimeDly(%lu)\n",(unsigned long)ticks);
     uint32_t us = ticks * 10000;
     if (us > 0) sceKernelDelayThread(us);
 }
@@ -362,6 +412,7 @@ static uint32_t hle_OSTaskDel(uint32_t prio) {
 }
 
 static uint32_t hle_OSSemCreate(uint32_t count) {
+    printf("[HLE] OSSemCreate(%lu)\n",(unsigned long)count);
     if (g_sem_count >= MAX_SEMS) return 0;
     SceUID sem = sceKernelCreateSema("qsem", 0, count, 255, NULL);
     if (sem < 0) return 0;
@@ -374,6 +425,7 @@ static uint32_t hle_OSSemCreate(uint32_t count) {
 }
 
 static void hle_OSSemPend(uint32_t sem_addr, uint32_t timeout, uint32_t *err_ptr) {
+    printf("[HLE] OSSemPend\n");
     (void)timeout;
     int i = find_sem(sem_addr);
     if (i >= 0) {
@@ -383,6 +435,7 @@ static void hle_OSSemPend(uint32_t sem_addr, uint32_t timeout, uint32_t *err_ptr
 }
 
 static uint32_t hle_OSSemPost(uint32_t sem_addr) {
+    printf("[HLE] OSSemPost\n");
     int i = find_sem(sem_addr);
     if (i >= 0) {
         sceKernelSignalSema(g_sems[i].psp_sem, 1);
@@ -391,6 +444,7 @@ static uint32_t hle_OSSemPost(uint32_t sem_addr) {
 }
 
 static uint32_t hle_OSSemDel(uint32_t sem_addr) {
+    printf("[HLE] OSSemDel\n");
     int i = find_sem(sem_addr);
     if (i >= 0) {
         sceKernelDeleteSema(g_sems[i].psp_sem);
@@ -401,12 +455,13 @@ static uint32_t hle_OSSemDel(uint32_t sem_addr) {
     return 0;
 }
 
-static uint32_t hle_OSCPUSaveSR(void) { return 0; }
-static void     hle_OSCPURestoreSR(uint32_t sr) { (void)sr; }
+static uint32_t hle_OSCPUSaveSR(void) { printf("[HLE] OSCPUSaveSR\n"); return 0; }
+static void     hle_OSCPURestoreSR(uint32_t sr) { (void)sr; printf("[HLE] OSCPURestoreSR\n"); }
 
 /* ── String conversion ────────────────────────────────────────────────────── */
 
 static uint16_t *hle_to_unicode_le(const char *src) {
+    printf("[HLE] to_unicode_le(%s)\n", src);
     int i = 0;
     while (src[i] && i < 2046) {
         g_unicode_buf[i] = (uint16_t)(uint8_t)src[i];
@@ -417,6 +472,7 @@ static uint16_t *hle_to_unicode_le(const char *src) {
 }
 
 static char *hle_to_locale_ansi(const uint16_t *src) {
+    printf("[HLE] to_locale_ansi\n");
     int i = 0;
     while (src[i] && i < (int)sizeof(g_ansi_buf) - 1) {
         g_ansi_buf[i] = (char)(src[i] & 0xFF);
@@ -426,7 +482,7 @@ static char *hle_to_locale_ansi(const uint16_t *src) {
     return g_ansi_buf;
 }
 
-static uint32_t hle_get_current_language(void) { return 0; }
+static uint32_t hle_get_current_language(void) { printf("[HLE] get_current_language\n"); return 0; }
 
 /* ── Audio ────────────────────────────────────────────────────────────────── */
 
@@ -455,6 +511,7 @@ static uint32_t hle_waveout_open(uint32_t *params_ptr) {
 }
 
 static uint32_t hle_waveout_write(uint32_t handle, const int16_t *buf_ptr) {
+    printf("[HLE] waveout_write\n");
     (void)handle;
     if (g_audio_ch < 0) return 0;
 
@@ -484,12 +541,12 @@ static uint32_t hle_waveout_write(uint32_t handle, const int16_t *buf_ptr) {
 
 static uint32_t hle_waveout_can_write(uint32_t handle) {
     (void)handle;
-    /* PSP audio is blocking, so always report ready.
-     * The blocking output call handles flow control. */
+    printf("[HLE] waveout_can_write\n");
     return 1;
 }
 
 static uint32_t hle_waveout_close(uint32_t handle) {
+    printf("[HLE] waveout_close\n");
     (void)handle;
     if (g_audio_ch == 0x1000) {
         sceAudioSRCChRelease();
@@ -509,10 +566,10 @@ static void hle_vxGoHome(void) {
 }
 
 /* No-ops */
-static void     hle_nop(void) {}
-static uint32_t hle_stub_zero(void) { return 0; }
-static uint32_t hle_stub_one(void) { return 1; }
-static uint32_t hle_stub_neg1(void) { return (uint32_t)-1; }
+static void     hle_nop(void) { printf("[HLE] nop\n"); }
+static uint32_t hle_stub_zero(void) { printf("[HLE] stub_zero\n"); return 0; }
+static uint32_t hle_stub_one(void) { printf("[HLE] stub_one\n"); return 1; }
+static uint32_t hle_stub_neg1(void) { printf("[HLE] stub_neg1\n"); return (uint32_t)-1; }
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Dispatch table
@@ -522,9 +579,9 @@ static uint32_t hle_stub_neg1(void) { return (uint32_t)-1; }
 
 static const HleEntry hle_table[] = {
     /* C stdlib */
-    HLE("malloc",           malloc),
+    HLE("malloc",           hle_malloc),
     HLE("free",             free),
-    HLE("realloc",          realloc),
+    HLE("realloc",          hle_realloc),
     HLE("printf",           printf),
     HLE("sprintf",          sprintf),
     HLE("fprintf",          fprintf),

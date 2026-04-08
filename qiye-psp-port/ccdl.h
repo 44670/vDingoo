@@ -71,6 +71,15 @@ int ccdl_load_relocated_fd(CcdlBinary *ccdl, int app_fd,
                            uint32_t new_base);
 
 /**
+ * Load a pre-patched RAWD binary (code+BSS+trampolines) into new_base,
+ * then apply relocations. The patched RAWD replaces both code+data and BSS.
+ */
+int ccdl_load_relocated_rawd(CcdlBinary *ccdl, const uint8_t *rawd_data,
+                             uint32_t rawd_size,
+                             const uint8_t *reloc_data, uint32_t reloc_size,
+                             uint32_t new_base);
+
+/**
  * Patch each import stub with a J instruction to the corresponding HLE function.
  * Must be called AFTER ccdl_load_relocated.
  */

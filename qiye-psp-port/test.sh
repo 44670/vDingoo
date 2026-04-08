@@ -17,8 +17,6 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # PPSSPP setup
 PPSSPP_DIR="$HOME/ppsspp/squashfs-root"
 PPSSPP_BIN="$PPSSPP_DIR/bin/PPSSPPSDL"
-export LD_LIBRARY_PATH="$PPSSPP_DIR/lib:${LD_LIBRARY_PATH:-}"
-
 # PPSSPP memstick: ~/.config/ppsspp/PSP/
 MEMSTICK="$HOME/.config/ppsspp/PSP"
 GAME_DIR="$MEMSTICK/GAME/VDINGOO"
@@ -27,10 +25,13 @@ GAME_DIR="$MEMSTICK/GAME/VDINGOO"
 
 if [ "$1" != "--run" ]; then
     echo "=== Building ==="
-    make -C "$SCRIPT_DIR" clean
+    rm -f "$SCRIPT_DIR"/*.o "$SCRIPT_DIR"/*.elf "$SCRIPT_DIR"/EBOOT.PBP "$SCRIPT_DIR"/PARAM.SFO
     make -C "$SCRIPT_DIR" -j$(nproc)
     echo ""
 fi
+
+# Set LD_LIBRARY_PATH for PPSSPP only after build (avoids contaminating toolchain)
+export LD_LIBRARY_PATH="$PPSSPP_DIR/lib:${LD_LIBRARY_PATH:-}"
 
 # ── Deploy to memstick ─────────────────────────────────────────────────────
 
@@ -40,8 +41,8 @@ mkdir -p "$GAME_DIR/nand"
 # Copy EBOOT
 cp "$SCRIPT_DIR/EBOOT.PBP" "$GAME_DIR/"
 
-# Copy game data files (qiye.app, reloc table, and nand/ game assets)
-for f in qiye.patched.app qiye.reloc.patched.bin; do
+# Copy game data files
+for f in qiye.app qiye.patched.rawd.bin qiye.reloc.patched.bin; do
     src="$PROJECT_DIR/nand/$f"
     if [ ! -f "$src" ]; then
         src="$PROJECT_DIR/$f"
@@ -79,4 +80,4 @@ LOGFILE="$SCRIPT_DIR/ppsspp.log"
 echo "=== Running in PPSSPP ==="
 echo "Log: $LOGFILE"
 killall PPSSPPSDL 2>/dev/null || true
-"$PPSSPP_BIN" "$EBOOT_PATH" "$@" >> "$LOGFILE" 2>&1
+"$PPSSPP_BIN" "$EBOOT_PATH" -j --loglevel=1 >> "$LOGFILE" 2>&1

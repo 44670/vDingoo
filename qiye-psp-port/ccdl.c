@@ -6,6 +6,8 @@
 #ifdef _PSP
 #include <psputility.h>
 #include <pspkernel.h>
+#include <pspdebug.h>
+#define printf pspDebugScreenPrintf
 #endif
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
@@ -240,6 +242,49 @@ int ccdl_load_relocated_fd(CcdlBinary *ccdl, int app_fd,
         ccdl->imports[i].target_vaddr += delta;
     for (int i = 0; i < ccdl->export_count; i++)
         ccdl->exports[i].vaddr += delta;
+
+    printf("[RELOC] done: entry=0x%08lx load=0x%08lx\n",
+           (unsigned long)ccdl->entry_point, (unsigned long)ccdl->load_address);
+    return 0;
+}
+
+/* ── Load patched RAWD binary ────────────────────────────────────────────── */
+
+int ccdl_load_relocated_rawd(CcdlBinary *ccdl, const uint8_t *rawd_data,
+                             uint32_t rawd_size,
+                             const uint8_t *reloc_data, uint32_t reloc_size,
+                             uint32_t new_base) {
+    uint32_t old_base = ccdl->load_address;
+    uint32_t delta = new_base - old_base;
+
+    printf("[RELOC] 0x%08lx -> 0x%08lx (delta=0x%08lx)\n",
+           (unsigned long)old_base, (unsigned long)new_base, (unsigned long)delta);
+
+    /* Copy patched RAWD (code+BSS+trampolines) to target */
+    memcpy((void *)new_base, rawd_data, rawd_size);
+    printf("[LOADER] using patched RAWD (%lu bytes)\n", (unsigned long)rawd_size);
+
+    /* Patched RAWD includes everything — update sizes */
+    ccdl->data_size = rawd_size;
+    ccdl->memory_size = rawd_size;
+
+    /* Apply relocations */
+    if (apply_relocs(reloc_data, reloc_size, new_base, delta) < 0)
+        return -1;
+
+    /* Adjust CCDL addresses */
+    ccdl->load_address = new_base;
+    ccdl->entry_point += delta;
+    for (int i = 0; i < ccdl->import_count; i++)
+        ccdl->imports[i].target_vaddr += delta;
+    for (int i = 0; i < ccdl->export_count; i++)
+        ccdl->exports[i].vaddr += delta;
+
+    /* Flush dcache and invalidate icache after code modification */
+#ifdef _PSP
+    sceKernelDcacheWritebackAll();
+    sceKernelIcacheInvalidateAll();
+#endif
 
     printf("[RELOC] done: entry=0x%08lx load=0x%08lx\n",
            (unsigned long)ccdl->entry_point, (unsigned long)ccdl->load_address);

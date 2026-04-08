@@ -943,7 +943,7 @@ fn hle_exit(ctx: &mut EmuCtx) {
 /// Number of samples per waveout_write call (0x320 bytes / 2 = 400 i16 samples)
 const WAVEOUT_SAMPLES: usize = 400;
 /// Max queued bytes before waveout_can_write returns 0 (~100ms at 16kHz mono)
-const WAVEOUT_MAX_QUEUE: u32 = 16000 * 2 / 10; // ~3200 bytes
+const WAVEOUT_MAX_QUEUE: u32 = 16000 * 2; // 32000 bytes (~1s at 16kHz mono i16)
 
 fn hle_waveout_open(ctx: &mut EmuCtx) {
     // waveout_open(params_ptr) — params: { u32 sample_rate, u16 bits_per_sample }
@@ -980,6 +980,13 @@ fn hle_waveout_write(ctx: &mut EmuCtx) {
         for i in 0..WAVEOUT_SAMPLES {
             samples[i] = ctx.mem.read_u16(buf_ptr + (i as u32) * 2) as i16;
         }
+        // Detect repeated single-value buffers
+        let first = samples[0] as u16;
+        if samples.iter().all(|&s| s as u16 == first) {
+            eprintln!("[AUDIO] waveout_write: all-repeat u16=0x{:04X} ({})", first, first as i16);
+        } else {
+            eprintln!("[AUDIO] waveout_write: {:?}", &samples[..]);
+        }
         let _ = queue.queue_audio(&samples);
     }
     ctx.cpu.set_gpr(2, 0);
@@ -988,8 +995,11 @@ fn hle_waveout_write(ctx: &mut EmuCtx) {
 fn hle_waveout_can_write(ctx: &mut EmuCtx) {
     if let Some(ref queue) = ctx.sdl.audio_queue {
         let queued = queue.size();
-        ctx.cpu.set_gpr(2, if queued < WAVEOUT_MAX_QUEUE { 1 } else { 0 });
+        let can = if queued < WAVEOUT_MAX_QUEUE { 1 } else { 0 };
+        eprintln!("[AUDIO] can_write: queued={} max={} -> {}", queued, WAVEOUT_MAX_QUEUE, can);
+        ctx.cpu.set_gpr(2, can);
     } else {
+        eprintln!("[AUDIO] can_write: no queue!");
         ctx.cpu.set_gpr(2, 0);
     }
 }

@@ -18,9 +18,11 @@
 #include "ccdl.h"
 #include "hle.h"
 
+#define printf pspDebugScreenPrintf
+
 PSP_MODULE_INFO("vDingoo", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
-PSP_HEAP_SIZE_KB(30 * 1024);
+PSP_HEAP_SIZE_KB(20*1024);
 
 /* ── Exit callbacks ───────────────────────────────────────────────────────── */
 
@@ -110,14 +112,15 @@ int main(int argc, char *argv[]) {
 
     /* ── Load qiye.app header ──────────────────────────────────────────── */
 
-    /* On PSP we can't malloc the full 57MB app file.
-     * Strategy: read only the header to parse CCDL tables,
-     * then stream RAWD directly into target memory. */
+    /* Strategy: read CCDL header from original .app for import/export tables,
+     * then load the patched RAWD binary (code+BSS+trampolines from rewrite.py)
+     * and the patched reloc table. */
 
-    const char *app_path  = "ms0:/PSP/GAME/VDINGOO/nand/qiye.patched.app";
+    const char *app_path   = "ms0:/PSP/GAME/VDINGOO/nand/qiye.app";
+    const char *rawd_path  = "ms0:/PSP/GAME/VDINGOO/nand/qiye.patched.rawd.bin";
     const char *reloc_path = "ms0:/PSP/GAME/VDINGOO/nand/qiye.reloc.patched.bin";
 
-    /* Read CCDL header — first 4KB is more than enough for IMPT+EXPT tables */
+    /* Read CCDL header from original .app — first 4KB has IMPT+EXPT tables */
     #define HEADER_SIZE 4096
     uint8_t header_buf[HEADER_SIZE];
 
@@ -128,14 +131,25 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     sceIoRead(app_fd, header_buf, HEADER_SIZE);
-    printf("Opened %s\n", app_path);
+    sceIoClose(app_fd);
+    printf("Parsed header from %s\n", app_path);
 
-    /* Load reloc table (172KB — fits easily) */
+    /* Load patched RAWD (code+BSS+trampolines, ~1.4MB) */
+    uint32_t rawd_size = 0;
+    uint8_t *rawd_data = load_file(rawd_path, &rawd_size);
+    if (!rawd_data) {
+        printf("ERROR: Cannot load %s\n", rawd_path);
+        sceKernelSleepThread();
+        return 1;
+    }
+    printf("Loaded %s (%lu bytes)\n", rawd_path, (unsigned long)rawd_size);
+
+    /* Load patched reloc table */
     uint32_t reloc_size = 0;
     uint8_t *reloc_data = load_file(reloc_path, &reloc_size);
     if (!reloc_data) {
         printf("ERROR: Cannot load %s\n", reloc_path);
-        sceIoClose(app_fd);
+        free(rawd_data);
         sceKernelSleepThread();
         return 1;
     }
@@ -149,26 +163,28 @@ int main(int argc, char *argv[]) {
         goto fail;
     }
 
-    /* ── Allocate memory for game code+data+bss ──────────────────────────── */
+    /* ── Allocate memory for game code+data+trampolines ─────────────────── */
 
     /* Align to 64KB so delta & 0xFFFF == 0 (required for LO16 relocs) */
-    void *game_raw = malloc(ccdl.memory_size + 0x10000);
+    uint32_t alloc_size = rawd_size > ccdl.memory_size ? rawd_size : ccdl.memory_size;
+    void *game_raw = malloc(alloc_size + 0x10000);
     if (!game_raw) {
-        printf("ERROR: malloc(%lu) failed\n", (unsigned long)(ccdl.memory_size + 0x10000));
+        printf("ERROR: malloc(%lu) failed\n", (unsigned long)(alloc_size + 0x10000));
         goto fail;
     }
     uint32_t new_base = ((uint32_t)game_raw + 0xFFFF) & ~0xFFFF;
     printf("Game memory at 0x%08lx (%lu bytes)\n",
-           (unsigned long)new_base, (unsigned long)ccdl.memory_size);
+           (unsigned long)new_base, (unsigned long)alloc_size);
 
-    /* ── Stream RAWD and relocate ──────────────────────────────────────── */
+    /* ── Load patched RAWD and relocate ────────────────────────────────── */
 
-    if (ccdl_load_relocated_fd(&ccdl, app_fd, reloc_data, reloc_size, new_base) < 0) {
+    if (ccdl_load_relocated_rawd(&ccdl, rawd_data, rawd_size,
+                                  reloc_data, reloc_size, new_base) < 0) {
         printf("ERROR: relocation failed\n");
         goto fail;
     }
 
-    sceIoClose(app_fd); app_fd = -1;
+    free(rawd_data); rawd_data = NULL;
     free(reloc_data); reloc_data = NULL;
 
     /* ── Patch imports ──────────────────────────────────────────────────── */
@@ -178,10 +194,6 @@ int main(int argc, char *argv[]) {
     const HleEntry *hle_table;
     int hle_count = hle_get_table(&hle_table);
     ccdl_patch_imports(&ccdl, hle_table, hle_count);
-
-    /* ── Setup display ──────────────────────────────────────────────────── */
-
-    setup_display();
 
     /* ── Phase 1: _start(0, 0) ──────────────────────────────────────────── */
 
@@ -229,7 +241,7 @@ int main(int argc, char *argv[]) {
     return 0;
 
 fail:
-    if (app_fd >= 0) sceIoClose(app_fd);
+    if (rawd_data) free(rawd_data);
     if (reloc_data) free(reloc_data);
     printf("\nPress HOME to exit.\n");
     sceKernelSleepThread();
