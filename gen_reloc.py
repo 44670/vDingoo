@@ -28,6 +28,18 @@ DATA_SIZE   = 0x13A2E0    # code+data size on disk
 MEM_SIZE    = 0x144880    # code+data+bss
 END_ADDR    = LOAD_ADDR + MEM_SIZE  # 0x80B44880
 
+# 7 known false positives: lb/lbu instructions whose encoding looks like pointers
+# See QIYE_RELOC_FP.md for details
+DATA32_FALSE_POSITIVES = {
+    0x80A0155C,  # lb $a3, 0($a1) in strstr
+    0x80A01834,  # lb $s0, 0($a1) in sscanf
+    0x80A03664,  # lb $v0, 0($a1) in sprintf
+    0x80A037E4,  # lb $v0, 0($a1) in sprintf
+    0x80A0DF48,  # lb $v0, 0x6b($a1) in Scene_updateTrigger
+    0x80A41930,  # lb $v0, 0x68($a1) in GameUnit_updateVisibility
+    0x80AD97D8,  # lb $v0, 0($a1) in hashString
+}
+
 # MIPS instruction helpers
 def get_opcode(inst):
     return (inst >> 26) & 0x3F
@@ -49,8 +61,8 @@ def get_j_target(inst):
     return (inst & 0x03FFFFFF) << 2
 
 def in_range(addr):
-    """Check if address falls within the binary's address space."""
-    return LOAD_ADDR <= addr < END_ADDR
+    """Check if address falls within the binary's address space (inclusive end)."""
+    return LOAD_ADDR <= addr <= END_ADDR
 
 def addr_to_offset(addr):
     return addr - LOAD_ADDR
@@ -153,13 +165,19 @@ def scan_instructions(code):
             del hi16_pending[rs]
             continue
 
+        # addu/add (R-type): lui $r, hi; addu $r, $r, $idx — page base + register index.
+        # Only the lui needs relocation; the addu adds a dynamic register value, not an immediate.
+        if opcode == 0x00 and (inst & 0x3F) in (0x20, 0x21):  # ADD/ADDU
+            func_rs = rs
+            if func_rs in hi16_pending:
+                hi_addr, hi_val = hi16_pending[func_rs]
+                if in_range(hi_val):
+                    relocs.append((hi_addr, RELOC_HI16, hi_val))
+                del hi16_pending[func_rs]
+            continue
+
         # Any other instruction using rs clears the pending HI16
         if rs in hi16_pending:
-            # Check for standalone lui pointing into range
-            hi_addr, hi_val = hi16_pending[rs]
-            if in_range(hi_val) or in_range(hi_val + 0xFFFF):
-                # Standalone lui - will record it but flag as unpaired
-                pass
             del hi16_pending[rs]
 
     return relocs
@@ -216,6 +234,8 @@ def scan_raw_data_words(code, code_addrs):
     for off in range(0, len(code), 4):
         addr = LOAD_ADDR + off
         if addr in code_addrs:
+            continue
+        if addr in DATA32_FALSE_POSITIVES:
             continue
         val = read_u32(code, off)
         if in_range(val):
