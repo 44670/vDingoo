@@ -10,3 +10,7 @@ nand
 
 *reloc*.txt
 *reloc*.bin
+
+*.o
+*.PBP
+*.SFO
