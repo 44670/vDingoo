@@ -84,6 +84,13 @@ impl Memory {
         let off = self.offset(addr);
         &mut self.data[off..off + len]
     }
+
+    /// Copy `len` bytes between guest addresses (handles overlapping regions)
+    pub fn guest_memcpy(&mut self, dst: u32, src: u32, len: usize) {
+        let src_off = self.offset(src);
+        let dst_off = self.offset(dst);
+        self.data.copy_within(src_off..src_off + len, dst_off);
+    }
 }
 
 #[cfg(test)]

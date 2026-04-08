@@ -9,6 +9,11 @@ use crate::mips::Cpu;
 
 const SIN_TABLE_BASE: u32 = 0x80ae_ddf0;
 
+#[cfg(not(feature = "reloc"))]
+const LCD_FRAMEBUF: u32 = 0x80F0_0000;
+#[cfg(feature = "reloc")]
+const LCD_FRAMEBUF: u32 = 0x08F0_0000;
+
 /// 16.16 fixed-point signed multiply (matches MIPS mult/madd/mflo sequence)
 #[inline(always)]
 fn fpmul(a: i32, b: i32) -> i32 {
@@ -267,4 +272,80 @@ pub fn renderer_draw_textured_spans(cpu: &mut Cpu, mem: &mut Memory) {
     // Return: PC = $ra
     cpu.pc = cpu.gpr[31];
     cpu.next_pc = cpu.pc.wrapping_add(4);
+}
+
+/// AOT: Raster_copyBuffer16to32 (0x80a5d648, 52 bytes, 3 basic blocks)
+///
+/// Copies width*height pixels from a u32 source buffer to a u16 destination,
+/// truncating each 32-bit value to 16-bit (keeping low halfword).
+///
+/// Original: void Raster_copyBuffer16to32(Raster* a0, u32* a1_src, u16* a2_dst)
+pub fn raster_copy_buffer_16to32(cpu: &mut Cpu, mem: &mut Memory) {
+    let raster = cpu.gpr[4]; // $a0
+    let mut src = cpu.gpr[5]; // $a1 — u32* source
+    let mut dst = cpu.gpr[6]; // $a2 — u16* destination
+
+    let height = mem.read_u32(raster.wrapping_add(8)) as i32;
+    let width = mem.read_u32(raster.wrapping_add(4)) as i32;
+    let count = width.wrapping_mul(height);
+
+    for _ in 0..count {
+        let val = mem.read_u32(src);
+        mem.write_u16(dst, val as u16);
+        src = src.wrapping_add(4);
+        dst = dst.wrapping_add(2);
+    }
+
+    cpu.pc = cpu.gpr[31];
+    cpu.next_pc = cpu.pc.wrapping_add(4);
+}
+
+/// AOT: Raster_presentFramebuffer (0x80a486e4, 136 bytes, 5 basic blocks)
+///
+/// Copies the internal render buffer (u16 RGB565 pixels) to the LCD
+/// framebuffer, then calls lcd_set_frame (HLE) to present.
+///
+/// This AOT replaces the 76800-iteration copy loop with a native memcpy,
+/// then sets PC to the lcd_set_frame tail so the interpreter handles HLE.
+///
+/// Original signature: int Raster_presentFramebuffer(Raster* a0, ?)
+pub fn raster_present_framebuffer(cpu: &mut Cpu, mem: &mut Memory) {
+    let raster = cpu.gpr[4]; // $a0
+
+    // Block 1: check dirty flag
+    let dirty = mem.read_u8(raster.wrapping_add(8));
+    if dirty == 0 {
+        // Early return: not dirty, return 0
+        cpu.set_gpr(2, 0); // $v0 = 0
+        cpu.pc = cpu.gpr[31];
+        cpu.next_pc = cpu.pc.wrapping_add(4);
+        return;
+    }
+
+    // ── Simulate prologue (so interpreter can run epilogue) ──────────────
+    let sp = cpu.gpr[29].wrapping_sub(0x18);
+    mem.write_u32(sp.wrapping_add(0x14), cpu.gpr[31]); // save $ra
+    mem.write_u32(sp.wrapping_add(0x10), cpu.gpr[16]); // save $s0
+    cpu.gpr[29] = sp;
+    cpu.gpr[16] = raster; // $s0 = raster
+
+    // Block 3: clear dirty flag, get LCD framebuffer
+    mem.write_u8(raster.wrapping_add(8), 0);
+    mem.write_u32(raster.wrapping_add(0xc), LCD_FRAMEBUF);
+
+    // Native bulk copy: src=*(raster+4), dst=LCD_FRAMEBUF, count=width*height*2
+    let src = mem.read_u32(raster.wrapping_add(4));
+    let width = mem.read_u32(raster.wrapping_add(0x10)) as i32;
+    let height = mem.read_u32(raster.wrapping_add(0x14)) as i32;
+    let pixel_count = width.wrapping_mul(height);
+
+    if pixel_count > 0 {
+        let byte_count = (pixel_count as u32) << 1;
+        mem.guest_memcpy(LCD_FRAMEBUF, src, byte_count as usize);
+    }
+
+    // Set PC to the lcd_set_frame tail (0x80a4874c: jal lcd_set_frame_wrapper)
+    // The interpreter will handle: HLE call → set dirty=1 → epilogue → return
+    cpu.pc = 0x80a4874c;
+    cpu.next_pc = 0x80a48750;
 }

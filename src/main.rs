@@ -237,14 +237,23 @@ fn run_until_sentinel(ctx: &mut EmuCtx, trace: bool, profile: bool, max_insns: u
         let pre_pc = ctx.cpu.pc;
 
         // AOT: skip interpreter for hot functions
-        if pre_pc == 0x80a86c40 {
-            aot_qiye::renderer_draw_textured_spans(&mut ctx.cpu, ctx.mem);
-            ctx.cpu.insn_count += 893; // ~893 instructions per call on average
-            if profile {
-                *pc_samples.entry(pre_pc).or_insert(0) += 1;
-                next_sample = ctx.cpu.insn_count + SAMPLE_INTERVAL;
+        match pre_pc {
+            0x80a86c40 => {
+                aot_qiye::renderer_draw_textured_spans(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 893;
+                continue;
             }
-            continue;
+            0x80a486e4 => {
+                aot_qiye::raster_present_framebuffer(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 76810;
+                continue;
+            }
+            0x80a5d648 => {
+                aot_qiye::raster_copy_buffer_16to32(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 76806;
+                continue;
+            }
+            _ => {}
         }
 
         match ctx.cpu.step(ctx.mem) {
