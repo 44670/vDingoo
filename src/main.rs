@@ -66,6 +66,7 @@ fn main() {
     // Init SDL2
     let sdl_context = sdl2::init().expect("Failed to init SDL2");
     let video = sdl_context.video().expect("Failed to init SDL2 video");
+    let audio = sdl_context.audio().expect("Failed to init SDL2 audio");
     let window = video
         .window("vDingoo — qiye", 320 * 2, 240 * 2)
         .position_centered()
@@ -83,7 +84,7 @@ fn main() {
     let texture: sdl2::render::Texture<'static> = unsafe { std::mem::transmute(texture) };
     std::mem::forget(creator);
 
-    let mut sdl_state = SdlState { canvas, event_pump, texture };
+    let mut sdl_state = SdlState { canvas, event_pump, texture, audio, audio_queue: None };
 
     let mut cpu = Cpu::new();
     cpu.pc = ccdl.entry_point;
@@ -137,6 +138,9 @@ fn main() {
     cpu.set_gpr(31, SENTINEL_RA);
     mem.write_u32(DEFAULT_SP + 0x10, SENTINEL_RA);
 
+    // Register AppMain as Task 0
+    hle_state.init_main_task(&cpu);
+
     // Phase 2: Run AppMain — game loop
     {
         let mut ctx = EmuCtx {
@@ -177,6 +181,11 @@ fn run_until_sentinel(ctx: &mut EmuCtx, trace: bool, max_insns: u64) {
                 if pc == SENTINEL_RA {
                     eprintln!("[STOP] returned to sentinel ($ra=0x{SENTINEL_RA:08x})");
                     break;
+                }
+
+                if pc == ctx.hle.task_sentinel() {
+                    ctx.hle.task_returned(ctx.cpu);
+                    continue;
                 }
 
                 if let Some(idx) = ctx.hle.is_hle_addr(pc) {

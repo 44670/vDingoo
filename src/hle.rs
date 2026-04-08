@@ -3,6 +3,8 @@ use crate::loader::ImportEntry;
 use crate::mem::Memory;
 use crate::mips::Cpu;
 
+use sdl2::audio::AudioQueue;
+use sdl2::AudioSubsystem;
 use sdl2::event::Event;
 use sdl2::keyboard::Scancode;
 use sdl2::render::{Canvas, Texture};
@@ -39,6 +41,38 @@ const KEY_START: u32 = 0x0000_0800;
 
 type HleFn = fn(&mut EmuCtx);
 
+// ── Task System ─────────────────────────────────────────────────────────────
+
+const TASK_SENTINEL: u32 = 0xDEAD_0004;
+
+#[derive(Clone)]
+struct SavedCpuState {
+    gpr: [u32; 32],
+    pc: u32,
+    next_pc: u32,
+    hi: u32,
+    lo: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TaskStatus {
+    Ready,
+    Running,
+    WaitSem(u32),     // blocked on semaphore address
+    Sleeping(u32),    // wake at this tick count
+    Dead,
+}
+
+struct Task {
+    status: TaskStatus,
+    priority: u8,
+    state: SavedCpuState,
+}
+
+struct Semaphore {
+    count: i32,
+}
+
 pub struct HleState {
     handlers: Vec<HleFn>,
     names: Vec<String>,
@@ -51,12 +85,19 @@ pub struct HleState {
     start_time: Instant,
     suppress: HashMap<String, u32>,
     pub frame_count: u64,
+    // Task system
+    tasks: Vec<Task>,
+    current_task: usize,
+    semaphores: HashMap<u32, Semaphore>,
+    context_switched: bool, // set by HLE handlers that do a context switch
 }
 
 pub struct SdlState {
     pub canvas: Canvas<Window>,
     pub event_pump: EventPump,
     pub texture: Texture<'static>,
+    pub audio: AudioSubsystem,
+    pub audio_queue: Option<AudioQueue<i16>>,
 }
 
 /// Everything the HLE handlers need access to.
@@ -82,6 +123,10 @@ impl HleState {
             start_time: Instant::now(),
             suppress: HashMap::new(),
             frame_count: 0,
+            tasks: Vec::new(),
+            current_task: 0,
+            semaphores: HashMap::new(),
+            context_switched: false,
         };
 
         let mut import_map = HashMap::new();
@@ -138,12 +183,13 @@ impl HleState {
                 // OS / RTOS
                 "OSSemCreate" => hle_ossem_create,
                 "OSSemPend" => hle_ossem_pend,
-                "OSSemPost" | "OSSemDel" => hle_stub_zero,
+                "OSSemPost" => hle_ossem_post,
+                "OSSemDel" => hle_ossem_del,
                 "OSTimeGet" => hle_get_tick,
                 "GetTickCount" => hle_get_tick_ms,
                 "OSTimeDly" => hle_os_time_dly,
                 "OSTaskCreate" => hle_os_task_create,
-                "OSTaskDel" => hle_stub_zero,
+                "OSTaskDel" => hle_os_task_del,
                 "OSCPUSaveSR" => hle_stub_zero,
                 "OSCPURestoreSR" => hle_nop,
 
@@ -152,10 +198,13 @@ impl HleState {
                 "__to_locale_ansi" => hle_to_locale_ansi,
                 "get_current_language" => hle_stub_zero,
 
-                // Audio (no-op stubs for now)
-                "waveout_open" | "waveout_close" | "waveout_close_at_once"
-                | "waveout_set_volume" | "waveout_write" => hle_stub_zero,
-                "waveout_can_write" | "pcm_can_write" => hle_stub_one,
+                // Audio
+                "waveout_open" => hle_waveout_open,
+                "waveout_write" => hle_waveout_write,
+                "waveout_can_write" => hle_waveout_can_write,
+                "waveout_close" | "waveout_close_at_once" => hle_waveout_close,
+                "waveout_set_volume" => hle_stub_zero,
+                "pcm_can_write" => hle_stub_one,
                 "pcm_ioctl" => hle_stub_zero,
                 "HP_Mute_sw" => hle_nop,
 
@@ -212,6 +261,124 @@ impl HleState {
     pub fn name(&self, idx: usize) -> &str {
         &self.names[idx]
     }
+
+    /// Register the current CPU state as Task 0 (AppMain). Call before Phase 2 execution.
+    pub fn init_main_task(&mut self, cpu: &Cpu) {
+        self.tasks.clear();
+        self.current_task = 0;
+        self.tasks.push(Task {
+            status: TaskStatus::Running,
+            priority: 0,
+            state: SavedCpuState {
+                gpr: cpu.gpr,
+                pc: cpu.pc,
+                next_pc: cpu.next_pc,
+                hi: cpu.hi,
+                lo: cpu.lo,
+            },
+        });
+        eprintln!("[TASK] Task 0 (AppMain) registered, priority=0");
+    }
+
+    /// Handle a task returning to TASK_SENTINEL — mark dead and switch.
+    pub fn task_returned(&mut self, cpu: &mut Cpu) {
+        let tid = self.current_task;
+        eprintln!("[TASK] Task {} returned (hit TASK_SENTINEL)", tid);
+        self.tasks[tid].status = TaskStatus::Dead;
+        self.schedule(cpu);
+    }
+
+    pub fn task_sentinel(&self) -> u32 {
+        TASK_SENTINEL
+    }
+
+    fn save_cpu(&mut self, cpu: &Cpu) {
+        let t = &mut self.tasks[self.current_task];
+        t.state.gpr = cpu.gpr;
+        t.state.pc = cpu.pc;
+        t.state.next_pc = cpu.next_pc;
+        t.state.hi = cpu.hi;
+        t.state.lo = cpu.lo;
+    }
+
+    fn load_cpu(&self, cpu: &mut Cpu) {
+        let t = &self.tasks[self.current_task];
+        cpu.gpr = t.state.gpr;
+        cpu.pc = t.state.pc;
+        cpu.next_pc = t.state.next_pc;
+        cpu.hi = t.state.hi;
+        cpu.lo = t.state.lo;
+    }
+
+    fn current_tick(&self) -> u32 {
+        (self.start_time.elapsed().as_millis() / 10) as u32
+    }
+
+    fn schedule(&mut self, cpu: &mut Cpu) {
+        self.context_switched = true;
+
+        // Save current task (unless Dead — state doesn't matter)
+        if self.tasks[self.current_task].status != TaskStatus::Dead {
+            self.save_cpu(cpu);
+        }
+
+        // Wake sleeping tasks
+        let now = self.current_tick();
+        for t in &mut self.tasks {
+            if let TaskStatus::Sleeping(wake_at) = t.status {
+                if now >= wake_at {
+                    t.status = TaskStatus::Ready;
+                }
+            }
+        }
+
+        // Find highest-priority (lowest number) Ready task
+        let mut best: Option<usize> = None;
+        for (i, t) in self.tasks.iter().enumerate() {
+            if t.status == TaskStatus::Ready {
+                if best.is_none() || t.priority < self.tasks[best.unwrap()].priority {
+                    best = Some(i);
+                }
+            }
+        }
+
+        if let Some(next) = best {
+            self.tasks[next].status = TaskStatus::Running;
+            self.current_task = next;
+            self.load_cpu(cpu);
+        } else {
+            // No ready tasks — check if everyone is waiting on semaphores
+            let all_dead_or_wait = self.tasks.iter().all(|t|
+                matches!(t.status, TaskStatus::Dead | TaskStatus::WaitSem(_) | TaskStatus::Sleeping(_))
+            );
+            if all_dead_or_wait {
+                // If tasks are sleeping, sleep the shortest time and retry
+                let mut min_wake: Option<u32> = None;
+                for t in &self.tasks {
+                    if let TaskStatus::Sleeping(wake_at) = t.status {
+                        min_wake = Some(min_wake.map_or(wake_at, |m: u32| m.min(wake_at)));
+                    }
+                }
+                if let Some(wake_at) = min_wake {
+                    let now = self.current_tick();
+                    if wake_at > now {
+                        let ms = ((wake_at - now) * 10) as u64;
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
+                    // Retry after sleeping
+                    self.schedule(cpu);
+                    return;
+                }
+                eprintln!("[TASK] WARNING: all tasks blocked or dead — possible deadlock");
+                // Fall back to task 0 if it exists and isn't dead
+                if self.tasks[0].status != TaskStatus::Dead {
+                    self.tasks[0].status = TaskStatus::Running;
+                    self.current_task = 0;
+                    self.load_cpu(cpu);
+                }
+            }
+        }
+    }
 }
 
 pub fn dispatch(ctx: &mut EmuCtx, idx: usize) {
@@ -240,8 +407,14 @@ pub fn dispatch(ctx: &mut EmuCtx, idx: usize) {
         }
     }
 
+    ctx.hle.context_switched = false;
     let func = ctx.hle.handlers[idx];
     func(ctx);
+
+    if ctx.hle.context_switched {
+        // Handler did a context switch — CPU state already set by schedule()
+        return;
+    }
 
     // Return to caller
     ctx.cpu.pc = ctx.cpu.gpr(31);
@@ -563,16 +736,78 @@ fn hle_get_game_vol(ctx: &mut EmuCtx) {
 // ── OS / RTOS ───────────────────────────────────────────────────────────────
 
 fn hle_ossem_create(ctx: &mut EmuCtx) {
+    let count = ctx.cpu.gpr(4) as i32;
     ctx.hle.sem_counter += 1;
-    ctx.cpu.set_gpr(2, 0x80E0_0000 + ctx.hle.sem_counter * 4);
+    let addr = 0x80E0_0000 + ctx.hle.sem_counter * 4;
+    ctx.hle.semaphores.insert(addr, Semaphore { count });
+    eprintln!("[TASK] OSSemCreate(count={}) → 0x{:08x}", count, addr);
+    ctx.cpu.set_gpr(2, addr);
 }
 
 fn hle_ossem_pend(ctx: &mut EmuCtx) {
     // OSSemPend(sem, timeout, &err)
+    let sem_addr = ctx.cpu.gpr(4);
     let err_ptr = ctx.cpu.gpr(6);
-    if err_ptr != 0 {
-        ctx.mem.write_u32(err_ptr, 0); // OS_ERR_NONE
+
+    if let Some(sem) = ctx.hle.semaphores.get_mut(&sem_addr) {
+        if sem.count > 0 {
+            sem.count -= 1;
+            if err_ptr != 0 { ctx.mem.write_u32(err_ptr, 0); }
+            // Fast path: semaphore available, no context switch
+            return;
+        }
     }
+
+    // Semaphore not available — block current task and switch
+    if err_ptr != 0 { ctx.mem.write_u32(err_ptr, 0); }
+
+    if ctx.hle.tasks.is_empty() {
+        // No task system yet (Phase 1) — just return immediately
+        return;
+    }
+
+    let tid = ctx.hle.current_task;
+    ctx.hle.tasks[tid].status = TaskStatus::WaitSem(sem_addr);
+    // Set CPU pc to return address so schedule saves the correct resume point
+    let ra = ctx.cpu.gpr(31);
+    ctx.cpu.pc = ra;
+    ctx.cpu.next_pc = ra.wrapping_add(4);
+    ctx.hle.schedule(ctx.cpu);
+}
+
+fn hle_ossem_post(ctx: &mut EmuCtx) {
+    let sem_addr = ctx.cpu.gpr(4);
+
+    if let Some(sem) = ctx.hle.semaphores.get_mut(&sem_addr) {
+        sem.count += 1;
+
+        // Wake highest-priority task waiting on this semaphore
+        let mut best: Option<usize> = None;
+        for (i, t) in ctx.hle.tasks.iter().enumerate() {
+            if t.status == TaskStatus::WaitSem(sem_addr) {
+                if best.is_none() || t.priority < ctx.hle.tasks[best.unwrap()].priority {
+                    best = Some(i);
+                }
+            }
+        }
+        if let Some(waiter) = best {
+            ctx.hle.semaphores.get_mut(&sem_addr).unwrap().count -= 1;
+            ctx.hle.tasks[waiter].status = TaskStatus::Ready;
+        }
+    }
+    ctx.cpu.set_gpr(2, 0); // OS_ERR_NONE
+}
+
+fn hle_ossem_del(ctx: &mut EmuCtx) {
+    let sem_addr = ctx.cpu.gpr(4);
+    // Wake all tasks waiting on this semaphore before removing it
+    for t in &mut ctx.hle.tasks {
+        if t.status == TaskStatus::WaitSem(sem_addr) {
+            t.status = TaskStatus::Ready;
+        }
+    }
+    ctx.hle.semaphores.remove(&sem_addr);
+    ctx.cpu.set_gpr(2, 0);
 }
 
 fn hle_get_tick(ctx: &mut EmuCtx) {
@@ -592,21 +827,141 @@ fn hle_get_tick_ms(ctx: &mut EmuCtx) {
 
 fn hle_os_time_dly(ctx: &mut EmuCtx) {
     let ticks = ctx.cpu.gpr(4);
-    let ms = (ticks * 10).max(1);
-    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+
+    if ctx.hle.tasks.is_empty() {
+        // No task system (Phase 1) — just sleep
+        let ms = (ticks * 10).max(1);
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+        return;
+    }
+
+    let wake_at = ctx.hle.current_tick().wrapping_add(ticks);
+    let tid = ctx.hle.current_task;
+    ctx.hle.tasks[tid].status = TaskStatus::Sleeping(wake_at);
+    let ra = ctx.cpu.gpr(31);
+    ctx.cpu.pc = ra;
+    ctx.cpu.next_pc = ra.wrapping_add(4);
+    ctx.hle.schedule(ctx.cpu);
 }
 
 fn hle_os_task_create(ctx: &mut EmuCtx) {
     let task_fn = ctx.cpu.gpr(4);
-    let _stack = ctx.cpu.gpr(6);
-    let prio = ctx.cpu.gpr(7);
-    eprintln!("[HLE] OSTaskCreate(fn=0x{:08x}, prio={}) — NOT spawning (single-threaded mode)", task_fn, prio);
+    let task_arg = ctx.cpu.gpr(5);
+    let stack_top = ctx.cpu.gpr(6);
+    let prio = (ctx.cpu.gpr(7) & 0xFF) as u8;
+
+    let tid = ctx.hle.tasks.len();
+    let mut state = SavedCpuState {
+        gpr: [0; 32],
+        pc: task_fn,
+        next_pc: task_fn.wrapping_add(4),
+        hi: 0,
+        lo: 0,
+    };
+    state.gpr[4] = task_arg;        // $a0 = task argument
+    state.gpr[29] = stack_top;      // $sp = caller-provided stack
+    state.gpr[31] = TASK_SENTINEL;  // $ra = sentinel for task return
+
+    ctx.hle.tasks.push(Task {
+        status: TaskStatus::Ready,
+        priority: prio,
+        state,
+    });
+
+    eprintln!("[TASK] OSTaskCreate(fn=0x{:08x}, arg=0x{:08x}, sp=0x{:08x}, prio={}) → task #{}",
+        task_fn, task_arg, stack_top, prio, tid);
     ctx.cpu.set_gpr(2, 0); // OS_ERR_NONE
+}
+
+fn hle_os_task_del(ctx: &mut EmuCtx) {
+    let prio = ctx.cpu.gpr(4);
+
+    if prio == 0xFF {
+        // Self-delete
+        let tid = ctx.hle.current_task;
+        eprintln!("[TASK] OSTaskDel(self) — killing task #{}", tid);
+        ctx.hle.tasks[tid].status = TaskStatus::Dead;
+        ctx.hle.schedule(ctx.cpu);
+    } else {
+        // Delete task by priority
+        for t in &mut ctx.hle.tasks {
+            if t.priority == prio as u8 && t.status != TaskStatus::Dead {
+                eprintln!("[TASK] OSTaskDel(prio={}) — killed", prio);
+                t.status = TaskStatus::Dead;
+                break;
+            }
+        }
+    }
+    ctx.cpu.set_gpr(2, 0);
 }
 
 fn hle_exit(ctx: &mut EmuCtx) {
     eprintln!("[HLE] vxGoHome() — requesting quit");
     ctx.hle.quit = true;
+}
+
+// ── Audio (waveout) ────────────────────────────────────────────────────────
+
+/// Number of samples per waveout_write call (0x320 bytes / 2 = 400 i16 samples)
+const WAVEOUT_SAMPLES: usize = 400;
+/// Max queued bytes before waveout_can_write returns 0 (~100ms at 16kHz mono)
+const WAVEOUT_MAX_QUEUE: u32 = 16000 * 2 / 10; // ~3200 bytes
+
+fn hle_waveout_open(ctx: &mut EmuCtx) {
+    // waveout_open(params_ptr) — params: { u32 sample_rate, u16 bits_per_sample }
+    let params = ctx.cpu.gpr(4);
+    let sample_rate = ctx.mem.read_u32(params);
+    let bits = ctx.mem.read_u16(params + 4);
+    eprintln!("[AUDIO] waveout_open(rate={}, bits={})", sample_rate, bits);
+
+    let desired = sdl2::audio::AudioSpecDesired {
+        freq: Some(sample_rate as i32),
+        channels: Some(1), // mono
+        samples: Some(WAVEOUT_SAMPLES as u16),
+    };
+
+    match AudioQueue::open_queue(&ctx.sdl.audio, None, &desired) {
+        Ok(queue) => {
+            queue.resume(); // start playback
+            ctx.sdl.audio_queue = Some(queue);
+            ctx.cpu.set_gpr(2, 1); // return non-zero handle
+        }
+        Err(e) => {
+            eprintln!("[AUDIO] Failed to open audio: {}", e);
+            ctx.cpu.set_gpr(2, 0);
+        }
+    }
+}
+
+fn hle_waveout_write(ctx: &mut EmuCtx) {
+    // waveout_write(handle, buf_ptr) — buf is 400 i16 samples (800 bytes)
+    let buf_ptr = ctx.cpu.gpr(5);
+
+    if let Some(ref queue) = ctx.sdl.audio_queue {
+        let mut samples = [0i16; WAVEOUT_SAMPLES];
+        for i in 0..WAVEOUT_SAMPLES {
+            samples[i] = ctx.mem.read_u16(buf_ptr + (i as u32) * 2) as i16;
+        }
+        let _ = queue.queue_audio(&samples);
+    }
+    ctx.cpu.set_gpr(2, 0);
+}
+
+fn hle_waveout_can_write(ctx: &mut EmuCtx) {
+    if let Some(ref queue) = ctx.sdl.audio_queue {
+        let queued = queue.size();
+        ctx.cpu.set_gpr(2, if queued < WAVEOUT_MAX_QUEUE { 1 } else { 0 });
+    } else {
+        ctx.cpu.set_gpr(2, 1);
+    }
+}
+
+fn hle_waveout_close(ctx: &mut EmuCtx) {
+    if let Some(queue) = ctx.sdl.audio_queue.take() {
+        queue.pause();
+        eprintln!("[AUDIO] waveout_close");
+    }
+    ctx.cpu.set_gpr(2, 0);
 }
 
 // ── Printf format engine ────────────────────────────────────────────────────
@@ -1055,5 +1410,448 @@ mod tests {
     #[test]
     fn test_sprintf_width_no_truncate() {
         assert_eq!(fmt("%2d", &[12345]), "12345");
+    }
+
+    // ── Task system ───────────────────────────────────────────────────────
+
+    fn make_hle() -> HleState {
+        HleState {
+            handlers: Vec::new(),
+            names: Vec::new(),
+            heap_ptr: 0x9800_0000,
+            alloc_sizes: HashMap::new(),
+            sem_counter: 0,
+            framebuf_addr: LCD_FRAMEBUF,
+            buttons: 0,
+            quit: false,
+            start_time: Instant::now(),
+            suppress: HashMap::new(),
+            frame_count: 0,
+            tasks: Vec::new(),
+            current_task: 0,
+            semaphores: HashMap::new(),
+            context_switched: false,
+        }
+    }
+
+    #[test]
+    fn test_init_main_task() {
+        let mut hle = make_hle();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x80A0_01A4;
+        cpu.next_pc = 0x80A0_01A8;
+        cpu.set_gpr(29, 0x8001_0000);
+        hle.init_main_task(&cpu);
+
+        assert_eq!(hle.tasks.len(), 1);
+        assert_eq!(hle.tasks[0].priority, 0);
+        assert_eq!(hle.tasks[0].status, TaskStatus::Running);
+        assert_eq!(hle.tasks[0].state.pc, 0x80A0_01A4);
+        assert_eq!(hle.current_task, 0);
+    }
+
+    #[test]
+    fn test_task_create() {
+        let mut hle = make_hle();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x80A0_0100;
+        cpu.next_pc = 0x80A0_0104;
+        hle.init_main_task(&cpu);
+
+        // Simulate OSTaskCreate(fn=0x80A47770, arg=0x9800_1000, stack=0x80B4_472C, prio=16)
+        cpu.set_gpr(4, 0x80A4_7770); // fn
+        cpu.set_gpr(5, 0x9800_1000); // arg
+        cpu.set_gpr(6, 0x80B4_472C); // stack top
+        cpu.set_gpr(7, 16);          // priority
+
+        let task_fn = cpu.gpr(4);
+        let task_arg = cpu.gpr(5);
+        let stack_top = cpu.gpr(6);
+        let prio = (cpu.gpr(7) & 0xFF) as u8;
+
+        let mut state = SavedCpuState {
+            gpr: [0; 32],
+            pc: task_fn,
+            next_pc: task_fn.wrapping_add(4),
+            hi: 0,
+            lo: 0,
+        };
+        state.gpr[4] = task_arg;
+        state.gpr[29] = stack_top;
+        state.gpr[31] = TASK_SENTINEL;
+
+        hle.tasks.push(Task {
+            status: TaskStatus::Ready,
+            priority: prio,
+            state,
+        });
+
+        assert_eq!(hle.tasks.len(), 2);
+        assert_eq!(hle.tasks[1].priority, 16);
+        assert_eq!(hle.tasks[1].status, TaskStatus::Ready);
+        assert_eq!(hle.tasks[1].state.pc, 0x80A4_7770);
+        assert_eq!(hle.tasks[1].state.gpr[4], 0x9800_1000); // $a0 = arg
+        assert_eq!(hle.tasks[1].state.gpr[29], 0x80B4_472C); // $sp
+        assert_eq!(hle.tasks[1].state.gpr[31], TASK_SENTINEL); // $ra
+    }
+
+    #[test]
+    fn test_semaphore_create() {
+        let mut hle = make_hle();
+
+        // Create semaphore with count=1
+        hle.sem_counter += 1;
+        let addr = 0x80E0_0000 + hle.sem_counter * 4;
+        hle.semaphores.insert(addr, Semaphore { count: 1 });
+
+        assert_eq!(addr, 0x80E0_0004);
+        assert_eq!(hle.semaphores[&addr].count, 1);
+    }
+
+    #[test]
+    fn test_semaphore_pend_available() {
+        let mut hle = make_hle();
+
+        // Create sem with count=1
+        let sem_addr = 0x80E0_0004;
+        hle.semaphores.insert(sem_addr, Semaphore { count: 1 });
+
+        // Pend — should decrement and return immediately
+        let sem = hle.semaphores.get_mut(&sem_addr).unwrap();
+        assert!(sem.count > 0);
+        sem.count -= 1;
+        assert_eq!(hle.semaphores[&sem_addr].count, 0);
+    }
+
+    #[test]
+    fn test_semaphore_post_wakes_waiter() {
+        let mut hle = make_hle();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x80A0_0100;
+        cpu.next_pc = 0x80A0_0104;
+        hle.init_main_task(&cpu);
+
+        // Create a second task that's waiting on a semaphore
+        let sem_addr = 0x80E0_0004;
+        hle.semaphores.insert(sem_addr, Semaphore { count: 0 });
+        hle.tasks.push(Task {
+            status: TaskStatus::WaitSem(sem_addr),
+            priority: 16,
+            state: SavedCpuState {
+                gpr: [0; 32],
+                pc: 0x80A4_7800,
+                next_pc: 0x80A4_7804,
+                hi: 0,
+                lo: 0,
+            },
+        });
+
+        // Post the semaphore — should wake the waiter
+        let sem = hle.semaphores.get_mut(&sem_addr).unwrap();
+        sem.count += 1;
+
+        // Find and wake highest-priority waiter
+        let mut best: Option<usize> = None;
+        for (i, t) in hle.tasks.iter().enumerate() {
+            if t.status == TaskStatus::WaitSem(sem_addr) {
+                if best.is_none() || t.priority < hle.tasks[best.unwrap()].priority {
+                    best = Some(i);
+                }
+            }
+        }
+        assert_eq!(best, Some(1));
+        hle.semaphores.get_mut(&sem_addr).unwrap().count -= 1;
+        hle.tasks[1].status = TaskStatus::Ready;
+
+        assert_eq!(hle.tasks[1].status, TaskStatus::Ready);
+        assert_eq!(hle.semaphores[&sem_addr].count, 0);
+    }
+
+    #[test]
+    fn test_schedule_picks_highest_priority() {
+        let mut hle = make_hle();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x80A0_0100;
+        cpu.next_pc = 0x80A0_0104;
+        cpu.set_gpr(29, 0x8001_0000);
+        hle.init_main_task(&cpu);
+
+        // Add two ready tasks with different priorities
+        hle.tasks.push(Task {
+            status: TaskStatus::Ready,
+            priority: 20,
+            state: SavedCpuState {
+                gpr: [0; 32],
+                pc: 0x80A4_0000,
+                next_pc: 0x80A4_0004,
+                hi: 0,
+                lo: 0,
+            },
+        });
+        hle.tasks.push(Task {
+            status: TaskStatus::Ready,
+            priority: 10,
+            state: SavedCpuState {
+                gpr: [0; 32],
+                pc: 0x80A5_0000,
+                next_pc: 0x80A5_0004,
+                hi: 0,
+                lo: 0,
+            },
+        });
+
+        // Mark main task as sleeping so scheduler picks from the others
+        hle.tasks[0].status = TaskStatus::Sleeping(u32::MAX);
+        hle.schedule(&mut cpu);
+
+        // Should pick task 2 (priority 10, lowest = highest priority)
+        assert_eq!(hle.current_task, 2);
+        assert_eq!(cpu.pc, 0x80A5_0000);
+        assert_eq!(hle.tasks[2].status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn test_schedule_skips_dead_tasks() {
+        let mut hle = make_hle();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x80A0_0100;
+        cpu.next_pc = 0x80A0_0104;
+        cpu.set_gpr(29, 0x8001_0000);
+        hle.init_main_task(&cpu);
+
+        // Add a dead task and a ready task
+        hle.tasks.push(Task {
+            status: TaskStatus::Dead,
+            priority: 5,
+            state: SavedCpuState {
+                gpr: [0; 32],
+                pc: 0xDEAD_BEEF,
+                next_pc: 0xDEAD_BEF3,
+                hi: 0,
+                lo: 0,
+            },
+        });
+        hle.tasks.push(Task {
+            status: TaskStatus::Ready,
+            priority: 10,
+            state: SavedCpuState {
+                gpr: [0; 32],
+                pc: 0x80A5_0000,
+                next_pc: 0x80A5_0004,
+                hi: 0,
+                lo: 0,
+            },
+        });
+
+        hle.tasks[0].status = TaskStatus::Sleeping(u32::MAX);
+        hle.schedule(&mut cpu);
+
+        // Should pick task 2, skipping the dead task 1
+        assert_eq!(hle.current_task, 2);
+        assert_eq!(cpu.pc, 0x80A5_0000);
+    }
+
+    #[test]
+    fn test_task_returned_marks_dead() {
+        let mut hle = make_hle();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x80A0_0100;
+        cpu.next_pc = 0x80A0_0104;
+        cpu.set_gpr(29, 0x8001_0000);
+        hle.init_main_task(&cpu);
+
+        // Add a second task (currently running)
+        hle.tasks.push(Task {
+            status: TaskStatus::Running,
+            priority: 16,
+            state: SavedCpuState {
+                gpr: [0; 32],
+                pc: 0x80A4_7770,
+                next_pc: 0x80A4_7774,
+                hi: 0,
+                lo: 0,
+            },
+        });
+        hle.tasks[0].status = TaskStatus::Ready;
+        hle.current_task = 1;
+        cpu.pc = TASK_SENTINEL;
+
+        hle.task_returned(&mut cpu);
+
+        assert_eq!(hle.tasks[1].status, TaskStatus::Dead);
+        // Should have switched back to task 0
+        assert_eq!(hle.current_task, 0);
+    }
+
+    #[test]
+    fn test_context_switch_saves_and_restores() {
+        let mut hle = make_hle();
+        let mut cpu = Cpu::new();
+
+        // Set up task 0 with distinctive register values
+        cpu.pc = 0x80A0_0100;
+        cpu.next_pc = 0x80A0_0104;
+        cpu.set_gpr(4, 0x1111);
+        cpu.set_gpr(29, 0x8001_0000);
+        cpu.hi = 0xAAAA;
+        cpu.lo = 0xBBBB;
+        hle.init_main_task(&cpu);
+
+        // Add task 1 with different register values
+        let mut t1_gpr = [0u32; 32];
+        t1_gpr[4] = 0x2222;
+        t1_gpr[29] = 0x80B4_472C;
+        hle.tasks.push(Task {
+            status: TaskStatus::Ready,
+            priority: 16,
+            state: SavedCpuState {
+                gpr: t1_gpr,
+                pc: 0x80A4_7770,
+                next_pc: 0x80A4_7774,
+                hi: 0xCCCC,
+                lo: 0xDDDD,
+            },
+        });
+
+        // Mark task 0 as sleeping, trigger schedule
+        hle.tasks[0].status = TaskStatus::Sleeping(u32::MAX);
+        hle.schedule(&mut cpu);
+
+        // CPU should now have task 1's state
+        assert_eq!(hle.current_task, 1);
+        assert_eq!(cpu.pc, 0x80A4_7770);
+        assert_eq!(cpu.gpr(4), 0x2222);
+        assert_eq!(cpu.gpr(29), 0x80B4_472C);
+        assert_eq!(cpu.hi, 0xCCCC);
+        assert_eq!(cpu.lo, 0xDDDD);
+
+        // Task 0's state should be saved
+        assert_eq!(hle.tasks[0].state.pc, 0x80A0_0100);
+        assert_eq!(hle.tasks[0].state.gpr[4], 0x1111);
+        assert_eq!(hle.tasks[0].state.hi, 0xAAAA);
+        assert_eq!(hle.tasks[0].state.lo, 0xBBBB);
+    }
+
+    #[test]
+    fn test_semaphore_pend_blocks_and_post_wakes() {
+        let mut hle = make_hle();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x80A0_0100;
+        cpu.next_pc = 0x80A0_0104;
+        cpu.set_gpr(29, 0x8001_0000);
+        hle.init_main_task(&cpu);
+
+        // Create sem with count=0
+        let sem_addr = 0x80E0_0004;
+        hle.semaphores.insert(sem_addr, Semaphore { count: 0 });
+
+        // Task 1 waiting on this sem
+        hle.tasks.push(Task {
+            status: TaskStatus::WaitSem(sem_addr),
+            priority: 16,
+            state: SavedCpuState {
+                gpr: [0; 32],
+                pc: 0x80A4_7800,
+                next_pc: 0x80A4_7804,
+                hi: 0,
+                lo: 0,
+            },
+        });
+
+        // Post: increment count, wake waiter
+        let sem = hle.semaphores.get_mut(&sem_addr).unwrap();
+        sem.count += 1;
+        // Find waiter
+        let mut best: Option<usize> = None;
+        for (i, t) in hle.tasks.iter().enumerate() {
+            if t.status == TaskStatus::WaitSem(sem_addr) {
+                if best.is_none() || t.priority < hle.tasks[best.unwrap()].priority {
+                    best = Some(i);
+                }
+            }
+        }
+        if let Some(waiter) = best {
+            hle.semaphores.get_mut(&sem_addr).unwrap().count -= 1;
+            hle.tasks[waiter].status = TaskStatus::Ready;
+        }
+
+        assert_eq!(hle.tasks[1].status, TaskStatus::Ready);
+        assert_eq!(hle.semaphores[&sem_addr].count, 0);
+    }
+
+    #[test]
+    fn test_sem_del_wakes_all_waiters() {
+        let mut hle = make_hle();
+        let sem_addr = 0x80E0_0008;
+        hle.semaphores.insert(sem_addr, Semaphore { count: 0 });
+
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x80A0_0100;
+        cpu.next_pc = 0x80A0_0104;
+        hle.init_main_task(&cpu);
+
+        // Two tasks waiting on the same sem
+        for pc in [0x80A4_0000u32, 0x80A5_0000] {
+            hle.tasks.push(Task {
+                status: TaskStatus::WaitSem(sem_addr),
+                priority: 16,
+                state: SavedCpuState {
+                    gpr: [0; 32],
+                    pc,
+                    next_pc: pc + 4,
+                    hi: 0,
+                    lo: 0,
+                },
+            });
+        }
+
+        // Delete sem — should wake all
+        for t in &mut hle.tasks {
+            if t.status == TaskStatus::WaitSem(sem_addr) {
+                t.status = TaskStatus::Ready;
+            }
+        }
+        hle.semaphores.remove(&sem_addr);
+
+        assert_eq!(hle.tasks[1].status, TaskStatus::Ready);
+        assert_eq!(hle.tasks[2].status, TaskStatus::Ready);
+        assert!(!hle.semaphores.contains_key(&sem_addr));
+    }
+
+    #[test]
+    fn test_task_del_by_priority() {
+        let mut hle = make_hle();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x80A0_0100;
+        cpu.next_pc = 0x80A0_0104;
+        hle.init_main_task(&cpu);
+
+        hle.tasks.push(Task {
+            status: TaskStatus::Ready,
+            priority: 16,
+            state: SavedCpuState {
+                gpr: [0; 32],
+                pc: 0x80A4_7770,
+                next_pc: 0x80A4_7774,
+                hi: 0,
+                lo: 0,
+            },
+        });
+
+        // Delete by priority 16
+        for t in &mut hle.tasks {
+            if t.priority == 16 && t.status != TaskStatus::Dead {
+                t.status = TaskStatus::Dead;
+                break;
+            }
+        }
+
+        assert_eq!(hle.tasks[1].status, TaskStatus::Dead);
+    }
+
+    #[test]
+    fn test_task_sentinel_value() {
+        let hle = make_hle();
+        assert_eq!(hle.task_sentinel(), 0xDEAD_0004);
     }
 }

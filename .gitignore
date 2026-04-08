@@ -6,3 +6,7 @@ __pycache__
 *.bndb
 sdcard
 nand
+*disassembly.txt
+
+*reloc*.txt
+*reloc*.bin
