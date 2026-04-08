@@ -41,7 +41,7 @@ mkdir -p "$GAME_DIR/nand"
 cp "$SCRIPT_DIR/EBOOT.PBP" "$GAME_DIR/"
 
 # Copy game data files (qiye.app, reloc table, and nand/ game assets)
-for f in qiye.app qiye.reloc.bin; do
+for f in qiye.patched.app qiye.reloc.patched.bin; do
     src="$PROJECT_DIR/nand/$f"
     if [ ! -f "$src" ]; then
         src="$PROJECT_DIR/$f"

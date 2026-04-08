@@ -196,127 +196,6 @@ int ccdl_load_relocated(CcdlBinary *ccdl, const uint8_t *app_data,
     return 0;
 }
 
-/* ── Patch SPECIAL2 → Allegrex SPECIAL ────────────────────────────────────── */
-/*
- * Dingoo MIPS32R1 uses SPECIAL2 (opcode 0x1C) for mul/madd/msub.
- * PSP Allegrex uses SPECIAL (opcode 0x00) with different func codes.
- *
- * SPECIAL2 madd (func=0) → SPECIAL madd (func=0x1C)   [same rd=0 encoding]
- * SPECIAL2 msub (func=4) → SPECIAL msub (func=0x2E)
- * SPECIAL2 mul rd,rs,rt (func=2) → mult rs,rt (func=0x18) at [i],
- *                                   mflo rd   (func=0x12) at [i+1],
- *                                   original [i+1] shifted to [i+2]... NO.
- *
- * For mul rd,rs,rt we can't expand in-place. Instead:
- *   Replace mul with mult rs,rt (writes HI:LO), then the NEXT instruction
- *   must be replaced with mflo rd. This means we need to move the next
- *   instruction. But we can't grow the code.
- *
- * Trick: mul rd,rs,rt actually writes rd AND HI:LO on MIPS32R1.
- * On Allegrex, mult rs,rt writes HI:LO. So we replace:
- *   mul rd,rs,rt  →  mult rs,rt   (overwrite in-place)
- * and insert mflo rd after it. But to "insert" we'd overwrite the next insn.
- *
- * Better: use a NOP-slide approach. The compiler typically emits:
- *   mul rd,rs,rt   (single insn does multiply and stores to rd)
- * We need TWO instructions. So we scan forward for a NOP or use the delay
- * slot trick. Actually — let's just overwrite the mul AND the next insn:
- *   [i]   = mult rs,rt
- *   [i+1] = mflo rd
- * and relocate the original [i+1] forward... NO, can't do that.
- *
- * FINAL APPROACH: generate a trampoline table in unused memory.
- * Each mul rd,rs,rt is replaced with J trampoline; NOP.
- * The trampoline does: mult rs,rt; mflo rd; J (return_addr); NOP.
- * Return addr = original_mul_addr + 4 (the next instruction).
- *
- * For madd/msub: simple 1:1 opcode+func remapping, no expansion needed.
- */
-
-static uint32_t *g_trampoline_ptr;
-
-static uint32_t make_j_addr(uint32_t addr) {
-    return 0x08000000 | ((addr >> 2) & 0x03FFFFFF);
-}
-
-static void patch_special2(uint32_t code_base, uint32_t code_size,
-                           uint32_t trampoline_base) {
-    uint32_t *code = (uint32_t *)code_base;
-    uint32_t count = code_size / 4;
-    g_trampoline_ptr = (uint32_t *)trampoline_base;
-    uint32_t n_madd = 0, n_mul = 0, n_msub = 0;
-
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t insn = code[i];
-        uint32_t op = (insn >> 26) & 0x3F;
-        if (op != 0x1C) continue; /* not SPECIAL2 */
-
-        uint32_t rs = (insn >> 21) & 0x1F;
-        uint32_t rt = (insn >> 16) & 0x1F;
-        uint32_t rd = (insn >> 11) & 0x1F;
-        uint32_t func = insn & 0x3F;
-
-        if (func == 0x00) {
-            /* madd rs,rt: SPECIAL2 func=0 → SPECIAL func=0x1C */
-            code[i] = (rs << 21) | (rt << 16) | 0x1C; /* op=0, func=0x1C */
-            n_madd++;
-        } else if (func == 0x04) {
-            /* msub rs,rt: SPECIAL2 func=4 → SPECIAL func=0x2E */
-            code[i] = (rs << 21) | (rt << 16) | 0x2E; /* op=0, func=0x2E */
-            n_msub++;
-        } else if (func == 0x02) {
-            /* mul rd,rs,rt → trampoline: mult rs,rt; mflo rd; j ret; nop */
-            uint32_t ret_addr = code_base + (i + 1) * 4;
-            uint32_t tramp_addr = (uint32_t)g_trampoline_ptr;
-
-            /* Write trampoline */
-            g_trampoline_ptr[0] = (rs << 21) | (rt << 16) | 0x18; /* mult rs,rt */
-            g_trampoline_ptr[1] = (rd << 11) | 0x12;              /* mflo rd */
-            g_trampoline_ptr[2] = make_j_addr(ret_addr);          /* j ret */
-            g_trampoline_ptr[3] = 0x00000000;                     /* nop */
-            g_trampoline_ptr += 4;
-
-            /* Replace mul with: j trampoline; nop (delay slot) */
-            /* But the delay slot [i+1] is a real instruction — we can't NOP it!
-             * Instead: j trampoline puts the DELAY SLOT instruction [i+1] in
-             * the trampoline before the j-return. Actually j executes delay slot.
-             * So: code[i] = j tramp; code[i+1] stays (it's the delay slot, runs
-             * before the jump takes effect, but we DON'T want it to run before
-             * the multiply).
-             *
-             * Hmm, j has a delay slot — code[i+1] executes BEFORE the jump.
-             * That's fine as long as code[i+1] doesn't depend on the mul result
-             * (which it could!). This is tricky.
-             *
-             * Simplest safe approach:
-             *   code[i]   = j trampoline
-             *   code[i+1] = nop  (sacrifice the delay slot)
-             *   trampoline: mult rs,rt; mflo rd; original_code[i+1]; j ret+4; nop
-             *   where ret+4 = code_base + (i+2)*4
-             */
-            uint32_t orig_next = code[i + 1]; /* save before overwriting */
-            ret_addr = code_base + (i + 2) * 4; /* skip both mul and nop */
-
-            /* Rewrite trampoline with saved next insn */
-            g_trampoline_ptr -= 4; /* back up */
-            g_trampoline_ptr[0] = (rs << 21) | (rt << 16) | 0x18; /* mult rs,rt */
-            g_trampoline_ptr[1] = (rd << 11) | 0x12;              /* mflo rd */
-            g_trampoline_ptr[2] = make_j_addr(ret_addr);          /* j ret */
-            g_trampoline_ptr[3] = orig_next;                      /* delay slot: original next insn */
-            g_trampoline_ptr += 4;
-
-            code[i]     = make_j_addr(tramp_addr);
-            code[i + 1] = 0x00000000; /* nop */
-            i++; /* skip the nop we just wrote */
-            n_mul++;
-        }
-    }
-
-    printf("[PATCH] SPECIAL2→Allegrex: madd=%lu mul=%lu msub=%lu (trampoline: %lu bytes)\n",
-           (unsigned long)n_madd, (unsigned long)n_mul, (unsigned long)n_msub,
-           (unsigned long)((uint32_t)g_trampoline_ptr - trampoline_base));
-}
-
 /* ── Streaming load (PSP — read RAWD from fd, no full-file malloc) ────────── */
 
 int ccdl_load_relocated_fd(CcdlBinary *ccdl, int app_fd,
@@ -353,11 +232,6 @@ int ccdl_load_relocated_fd(CcdlBinary *ccdl, int app_fd,
     /* Apply relocations */
     if (apply_relocs(reloc_data, reloc_size, new_base, delta) < 0)
         return -1;
-
-    /* Patch SPECIAL2 instructions (mul/madd/msub) for Allegrex compatibility.
-     * Trampoline goes right after BSS. */
-    uint32_t tramp_base = new_base + ccdl->memory_size;
-    patch_special2(new_base, ccdl->data_size, tramp_base);
 
     /* Adjust CCDL addresses */
     ccdl->load_address = new_base;

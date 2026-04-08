@@ -93,23 +93,35 @@ pub fn parse_ccdl(data: &[u8]) -> CcdlBinary {
 }
 
 pub fn load_ccdl(data: &[u8], mem: &mut Memory) -> CcdlBinary {
-    let ccdl = parse_ccdl(data);
+    let mut ccdl = parse_ccdl(data);
 
-    // Load code+data into guest memory at load_address
-    let rawd_off = {
-        let (off, _) = parse_section_hdr(data, 0x60, b"RAWD");
-        off as usize
-    };
-    let code = &data[rawd_off..rawd_off + ccdl.data_size as usize];
-    let dest = mem.slice_mut(ccdl.load_address, code.len());
-    dest.copy_from_slice(code);
+    // Check for patched RAWD binary (code+BSS+trampolines from rewrite.py)
+    let rawd_override = std::fs::read("nand/qiye.patched.rawd.bin").ok();
+    if let Some(ref rawd_data) = rawd_override {
+        // Patched RAWD: entire file is code+BSS+trampolines, load it all
+        let dest = mem.slice_mut(ccdl.load_address, rawd_data.len());
+        dest.copy_from_slice(rawd_data);
+        // Update sizes: data_size = full file, memory_size = same (no extra BSS)
+        ccdl.data_size = rawd_data.len() as u32;
+        ccdl.memory_size = rawd_data.len() as u32;
+        eprintln!("[LOADER] using patched RAWD ({} bytes)", rawd_data.len());
+    } else {
+        // Load code+data into guest memory at load_address
+        let rawd_off = {
+            let (off, _) = parse_section_hdr(data, 0x60, b"RAWD");
+            off as usize
+        };
+        let code = &data[rawd_off..rawd_off + ccdl.data_size as usize];
+        let dest = mem.slice_mut(ccdl.load_address, code.len());
+        dest.copy_from_slice(code);
 
-    // Zero BSS
-    let bss_start = ccdl.load_address + ccdl.data_size;
-    let bss_size = ccdl.memory_size - ccdl.data_size;
-    if bss_size > 0 {
-        let bss = mem.slice_mut(bss_start, bss_size as usize);
-        bss.fill(0);
+        // Zero BSS
+        let bss_start = ccdl.load_address + ccdl.data_size;
+        let bss_size = ccdl.memory_size - ccdl.data_size;
+        if bss_size > 0 {
+            let bss = mem.slice_mut(bss_start, bss_size as usize);
+            bss.fill(0);
+        }
     }
 
     ccdl
@@ -147,21 +159,31 @@ pub fn load_ccdl_relocated(app_data: &[u8], reloc_data: &[u8], mem: &mut Memory)
     // Adjust load address before loading into memory
     ccdl.load_address = new_base;
 
-    // Load code+data at new address
-    let rawd_off = {
-        let (off, _) = parse_section_hdr(app_data, 0x60, b"RAWD");
-        off as usize
-    };
-    let code = &app_data[rawd_off..rawd_off + ccdl.data_size as usize];
-    let dest = mem.slice_mut(new_base, code.len());
-    dest.copy_from_slice(code);
+    // Check for patched RAWD binary
+    let rawd_override = std::fs::read("nand/qiye.patched.rawd.bin").ok();
+    if let Some(ref rawd_data) = rawd_override {
+        let dest = mem.slice_mut(new_base, rawd_data.len());
+        dest.copy_from_slice(rawd_data);
+        ccdl.data_size = rawd_data.len() as u32;
+        ccdl.memory_size = rawd_data.len() as u32;
+        eprintln!("[LOADER] using patched RAWD ({} bytes)", rawd_data.len());
+    } else {
+        // Load code+data at new address
+        let rawd_off = {
+            let (off, _) = parse_section_hdr(app_data, 0x60, b"RAWD");
+            off as usize
+        };
+        let code = &app_data[rawd_off..rawd_off + ccdl.data_size as usize];
+        let dest = mem.slice_mut(new_base, code.len());
+        dest.copy_from_slice(code);
 
-    // Zero BSS at new address
-    let bss_start = new_base + ccdl.data_size;
-    let bss_size = ccdl.memory_size - ccdl.data_size;
-    if bss_size > 0 {
-        let bss = mem.slice_mut(bss_start, bss_size as usize);
-        bss.fill(0);
+        // Zero BSS at new address
+        let bss_start = new_base + ccdl.data_size;
+        let bss_size = ccdl.memory_size - ccdl.data_size;
+        if bss_size > 0 {
+            let bss = mem.slice_mut(bss_start, bss_size as usize);
+            bss.fill(0);
+        }
     }
 
     // Apply relocations

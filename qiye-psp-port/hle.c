@@ -27,7 +27,7 @@ static volatile int g_quit = 0;
 static uint32_t     g_buttons = 0;        /* current Dingoo-format button state */
 static uint64_t     g_start_time = 0;     /* microseconds at init */
 static uint32_t     g_frame_count = 0;
-static uint32_t     g_lcd_framebuf = LCD_FRAMEBUF; /* set by main after alloc */
+static uint16_t     g_framebuf[LCD_W * LCD_H] __attribute__((aligned(64)));
 
 /* Audio */
 static int          g_audio_ch = -1;      /* PSP audio channel */
@@ -256,13 +256,13 @@ static uint32_t hle_fsys_ferror(uint32_t fd) {
 /* ── LCD / Video ──────────────────────────────────────────────────────────── */
 
 static uint32_t hle_lcd_get_frame(void) {
-    return g_lcd_framebuf;
+    return (uint32_t)g_framebuf;
 }
 
 static void hle_lcd_set_frame(uint32_t addr) {
     (void)addr;
-    /* Copy 320x240 RGB565 from LCD_FRAMEBUF to PSP VRAM, centered */
-    const uint16_t *src = (const uint16_t *)LCD_FRAMEBUF;
+    /* Copy 320x240 RGB565 from guest framebuffer to PSP VRAM, centered */
+    const uint16_t *src = g_framebuf;
     uint16_t *dst = (uint16_t *)PSP_VRAM_BASE;
 
     /* Offset to center: y*stride + x */

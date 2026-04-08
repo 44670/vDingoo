@@ -190,6 +190,34 @@ impl Cpu {
                 0x2B => {
                     self.set_gpr(rd, (self.gpr(rs) < self.gpr(rt)) as u32);
                 }
+                // MADD (Allegrex encoding)
+                0x1C => {
+                    let result = ((self.hi as i64) << 32 | self.lo as i64)
+                        + (self.gpr(rs) as i32 as i64) * (self.gpr(rt) as i32 as i64);
+                    self.lo = result as u32;
+                    self.hi = (result >> 32) as u32;
+                }
+                // MADDU (Allegrex encoding)
+                0x1D => {
+                    let result = ((self.hi as u64) << 32 | self.lo as u64)
+                        + (self.gpr(rs) as u64) * (self.gpr(rt) as u64);
+                    self.lo = result as u32;
+                    self.hi = (result >> 32) as u32;
+                }
+                // MSUB (Allegrex encoding)
+                0x2E => {
+                    let result = ((self.hi as i64) << 32 | self.lo as i64)
+                        - (self.gpr(rs) as i32 as i64) * (self.gpr(rt) as i32 as i64);
+                    self.lo = result as u32;
+                    self.hi = (result >> 32) as u32;
+                }
+                // MSUBU (Allegrex encoding)
+                0x2F => {
+                    let result = ((self.hi as u64) << 32 | self.lo as u64)
+                        - (self.gpr(rs) as u64) * (self.gpr(rt) as u64);
+                    self.lo = result as u32;
+                    self.hi = (result >> 32) as u32;
+                }
                 _ => panic!(
                     "Unknown SPECIAL funct 0x{funct:02x} at 0x{current_pc:08x} (insn=0x{insn:08x})"
                 ),

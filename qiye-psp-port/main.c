@@ -101,14 +101,21 @@ int main(int argc, char *argv[]) {
     printf("vDingoo PSP — CCDL native loader\n");
     printf("================================\n\n");
 
+    /* Print heap info */
+    void *heap_lo = malloc(1);
+    void *heap_hi = malloc(1);
+    printf("Heap: 0x%08lx .. (30MB)\n", (unsigned long)heap_lo);
+    free(heap_hi);
+    free(heap_lo);
+
     /* ── Load qiye.app header ──────────────────────────────────────────── */
 
     /* On PSP we can't malloc the full 57MB app file.
      * Strategy: read only the header to parse CCDL tables,
      * then stream RAWD directly into target memory. */
 
-    const char *app_path  = "ms0:/PSP/GAME/VDINGOO/nand/qiye.app";
-    const char *reloc_path = "ms0:/PSP/GAME/VDINGOO/nand/qiye.reloc.bin";
+    const char *app_path  = "ms0:/PSP/GAME/VDINGOO/nand/qiye.patched.app";
+    const char *reloc_path = "ms0:/PSP/GAME/VDINGOO/nand/qiye.reloc.patched.bin";
 
     /* Read CCDL header — first 4KB is more than enough for IMPT+EXPT tables */
     #define HEADER_SIZE 4096
@@ -142,22 +149,17 @@ int main(int argc, char *argv[]) {
         goto fail;
     }
 
-    /* ── Allocate memory for game code+data+bss+trampolines ──────────────── */
+    /* ── Allocate memory for game code+data+bss ──────────────────────────── */
 
-    /* Extra space after BSS for mul→mult/mflo trampolines (~4K mul insns × 16B) */
-    uint32_t alloc_size = ccdl.memory_size + 0x10000;
-    /* Also include framebuffer space after the code block */
-    uint32_t fb_offset = alloc_size;
-    alloc_size += LCD_W * LCD_H * 2;
-
-    void *game_mem = malloc(alloc_size);
-    if (!game_mem) {
-        printf("ERROR: malloc(%lu) failed\n", (unsigned long)alloc_size);
+    /* Align to 64KB so delta & 0xFFFF == 0 (required for LO16 relocs) */
+    void *game_raw = malloc(ccdl.memory_size + 0x10000);
+    if (!game_raw) {
+        printf("ERROR: malloc(%lu) failed\n", (unsigned long)(ccdl.memory_size + 0x10000));
         goto fail;
     }
-    uint32_t new_base = (uint32_t)game_mem;
+    uint32_t new_base = ((uint32_t)game_raw + 0xFFFF) & ~0xFFFF;
     printf("Game memory at 0x%08lx (%lu bytes)\n",
-           (unsigned long)new_base, (unsigned long)alloc_size);
+           (unsigned long)new_base, (unsigned long)ccdl.memory_size);
 
     /* ── Stream RAWD and relocate ──────────────────────────────────────── */
 
@@ -220,9 +222,9 @@ int main(int argc, char *argv[]) {
 
     /* ── Cleanup ────────────────────────────────────────────────────────── */
 
+    free(game_raw);
     free(ccdl.imports);
     free(ccdl.exports);
-    sceKernelFreePartitionMemory(mem_block);
     sceKernelExitGame();
     return 0;
 

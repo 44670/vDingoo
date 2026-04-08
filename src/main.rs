@@ -15,6 +15,34 @@ use mips::{Cpu, StepResult};
 
 use std::path::PathBuf;
 
+// ── Global CPU pointer for panic hook ────────────────────────────────────────
+
+static CPU_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        let ptr = CPU_PTR.load(std::sync::atomic::Ordering::Relaxed);
+        if ptr != 0 {
+            let cpu = unsafe { &*(ptr as *const Cpu) };
+            let names = [
+                "zero","at","v0","v1","a0","a1","a2","a3",
+                "t0","t1","t2","t3","t4","t5","t6","t7",
+                "s0","s1","s2","s3","s4","s5","s6","s7",
+                "t8","t9","k0","k1","gp","sp","fp","ra",
+            ];
+            eprintln!("\n  PC=0x{:08x}  insn #{}", cpu.pc, cpu.insn_count);
+            for i in (0..32).step_by(4) {
+                eprintln!("  {:>4}={:08x} {:>4}={:08x} {:>4}={:08x} {:>4}={:08x}",
+                    names[i], cpu.gpr[i], names[i+1], cpu.gpr[i+1],
+                    names[i+2], cpu.gpr[i+2], names[i+3], cpu.gpr[i+3]);
+            }
+            eprintln!("  HI={:08x} LO={:08x}", cpu.hi, cpu.lo);
+        }
+    }));
+}
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const SENTINEL_RA: u32 = 0xDEAD_0000;
@@ -32,6 +60,8 @@ const SCRATCH_ADDR: u32 = 0x0801_1000;
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
+    install_panic_hook();
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: {} <app-file> [--trace] [--max-insns N]", args[0]);
@@ -67,7 +97,12 @@ fn main() {
 
     #[cfg(feature = "reloc")]
     let ccdl = {
-        let reloc_path = "nand/qiye.reloc.bin";
+        // Prefer patched reloc table if patched RAWD exists
+        let reloc_path = if std::path::Path::new("nand/qiye.patched.rawd.bin").exists() {
+            "nand/qiye.reloc.patched.bin"
+        } else {
+            "nand/qiye.reloc.bin"
+        };
         let reloc_data = std::fs::read(reloc_path).unwrap_or_else(|e| {
             eprintln!("Failed to read {reloc_path}: {e}");
             std::process::exit(1);
@@ -110,6 +145,7 @@ fn main() {
     let mut sdl_state = SdlState { canvas, event_pump, texture, audio, audio_queue: None };
 
     let mut cpu = Cpu::new();
+    CPU_PTR.store(&cpu as *const Cpu as usize, std::sync::atomic::Ordering::Relaxed);
     cpu.pc = ccdl.entry_point;
     cpu.next_pc = cpu.pc.wrapping_add(4);
     cpu.set_gpr(29, DEFAULT_SP);
