@@ -17,7 +17,6 @@ use std::path::PathBuf;
 const SENTINEL_RA: u32 = 0xDEAD_0000;
 const DEFAULT_SP: u32 = 0x8001_0000;
 const SCRATCH_ADDR: u32 = 0x8001_1000; // scratch area for writing strings etc.
-const APPMAIN_ADDR: u32 = 0x80A0_01A4;
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
@@ -42,10 +41,10 @@ fn main() {
         std::process::exit(1);
     });
 
-    // Determine base directory (where the .app file lives)
-    let app_abs = std::fs::canonicalize(app_path).unwrap_or_else(|_| PathBuf::from(app_path));
-    let base_dir = app_abs.parent().unwrap_or_else(|| std::path::Path::new(".")).join("nand");
+    // nand/ directory: all guest file I/O is confined here
+    let base_dir = PathBuf::from("nand");
     std::fs::create_dir_all(&base_dir).expect("Failed to create nand/ directory");
+    let app_abs = std::fs::canonicalize(app_path).unwrap_or_else(|_| PathBuf::from(app_path));
 
     let mut mem = Memory::new();
     let ccdl = load_ccdl(&data, &mut mem);
@@ -98,19 +97,27 @@ fn main() {
         run_until_sentinel(&mut ctx, trace, max_insns);
     }
 
-    eprintln!("=== Phase 2: AppMain(path) ===");
+    // Look up AppMain from exports
+    let appmain_addr = ccdl.exports.iter()
+        .find(|e| e.name == "AppMain")
+        .unwrap_or_else(|| {
+            eprintln!("No AppMain export found");
+            std::process::exit(1);
+        })
+        .vaddr;
+
+    eprintln!("=== Phase 2: AppMain(path) @ 0x{appmain_addr:08x} ===");
 
     // Write wide-string app path to scratch memory
-    // The game extracts the directory part (everything before last '\') as its working dir.
-    // We pass ".\qiye.app" so the game's working dir is "." — all file opens go through
-    // translate_path which strips ".\" and resolves relative to nand/.
+    // The game extracts the directory part (before last '\') as its working dir.
+    // We pass "\qiye.app" so the extracted dir is "" — all file paths resolve to nand/.
     let app_filename = app_abs.file_name().unwrap().to_string_lossy();
     let app_wpath = format!("\\{}", app_filename);
     write_wstring(&mut mem, SCRATCH_ADDR, &app_wpath);
 
     // Reset CPU for AppMain call
-    cpu.pc = APPMAIN_ADDR;
-    cpu.next_pc = APPMAIN_ADDR.wrapping_add(4);
+    cpu.pc = appmain_addr;
+    cpu.next_pc = appmain_addr.wrapping_add(4);
     cpu.set_gpr(4, SCRATCH_ADDR); // $a0 = path
     cpu.set_gpr(5, 0);            // $a1
     cpu.set_gpr(6, 0);            // $a2

@@ -351,31 +351,32 @@ fn hle_abort(_ctx: &mut EmuCtx) {
 // ── String Conversion ───────────────────────────────────────────────────────
 
 fn hle_to_unicode_le(ctx: &mut EmuCtx) {
-    let dst = ctx.cpu.gpr(4);
-    let src = ctx.cpu.gpr(5);
-    // Convert byte string to UCS-2 LE
-    let s = ctx.mem.read_string(src);
-    let mut off = dst;
+    // wchar_t* __to_unicode_le(char* src)
+    // Single arg: converts ANSI string in-place to UCS-2 LE, returns pointer
+    // Must work backwards to avoid overwriting source bytes
+    let addr = ctx.cpu.gpr(4);
+    let s = ctx.mem.read_string(addr);
+    let mut off = addr;
     for b in s.bytes() {
         ctx.mem.write_u16(off, b as u16);
         off += 2;
     }
     ctx.mem.write_u16(off, 0);
-    ctx.cpu.set_gpr(2, s.len() as u32);
+    ctx.cpu.set_gpr(2, addr);
 }
 
 fn hle_to_locale_ansi(ctx: &mut EmuCtx) {
-    let dst = ctx.cpu.gpr(4);
-    let src = ctx.cpu.gpr(5);
-    // Convert UCS-2 LE to byte string (lossy)
-    let ws = GuestFs::read_wstring(ctx.mem, src);
-    let mut off = dst;
+    // char* __to_locale_ansi(wchar_t* src)
+    // Single arg: converts UCS-2 LE wide string in-place to ANSI, returns pointer
+    let addr = ctx.cpu.gpr(4);
+    let ws = GuestFs::read_wstring(ctx.mem, addr);
+    let mut off = addr;
     for b in ws.bytes() {
         ctx.mem.write_u8(off, b);
         off += 1;
     }
     ctx.mem.write_u8(off, 0);
-    ctx.cpu.set_gpr(2, ws.len() as u32);
+    ctx.cpu.set_gpr(2, addr);
 }
 
 // ── Filesystem ──────────────────────────────────────────────────────────────
