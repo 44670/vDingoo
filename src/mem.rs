@@ -1,4 +1,8 @@
-const BASE: u32 = 0x8000_0000;
+#[cfg(not(feature = "reloc"))]
+pub(crate) const BASE: u32 = 0x8000_0000;
+#[cfg(feature = "reloc")]
+pub(crate) const BASE: u32 = 0x0800_0000;
+
 const SIZE: usize = 512 * 1024 * 1024; // 512 MB
 
 pub struct Memory {
@@ -86,35 +90,37 @@ impl Memory {
 mod tests {
     use super::*;
 
+    const TEST_ADDR: u32 = BASE + 0x00A0_0000;
+
     #[test]
     fn test_read_write_u8() {
         let mut mem = Memory::new();
-        mem.write_u8(0x80A0_0000, 0x42);
-        assert_eq!(mem.read_u8(0x80A0_0000), 0x42);
+        mem.write_u8(TEST_ADDR, 0x42);
+        assert_eq!(mem.read_u8(TEST_ADDR), 0x42);
     }
 
     #[test]
     fn test_read_write_u16() {
         let mut mem = Memory::new();
-        mem.write_u16(0x80A0_0000, 0xBEEF);
-        assert_eq!(mem.read_u16(0x80A0_0000), 0xBEEF);
+        mem.write_u16(TEST_ADDR, 0xBEEF);
+        assert_eq!(mem.read_u16(TEST_ADDR), 0xBEEF);
     }
 
     #[test]
     fn test_read_write_u32() {
         let mut mem = Memory::new();
-        mem.write_u32(0x80A0_0000, 0xDEAD_BEEF);
-        assert_eq!(mem.read_u32(0x80A0_0000), 0xDEAD_BEEF);
+        mem.write_u32(TEST_ADDR, 0xDEAD_BEEF);
+        assert_eq!(mem.read_u32(TEST_ADDR), 0xDEAD_BEEF);
     }
 
     #[test]
     fn test_endianness() {
         let mut mem = Memory::new();
-        mem.write_u32(0x80A0_0000, 0xDEAD_BEEF);
-        assert_eq!(mem.read_u8(0x80A0_0000), 0xEF); // LE: LSB first
-        assert_eq!(mem.read_u8(0x80A0_0001), 0xBE);
-        assert_eq!(mem.read_u8(0x80A0_0002), 0xAD);
-        assert_eq!(mem.read_u8(0x80A0_0003), 0xDE);
+        mem.write_u32(TEST_ADDR, 0xDEAD_BEEF);
+        assert_eq!(mem.read_u8(TEST_ADDR), 0xEF); // LE: LSB first
+        assert_eq!(mem.read_u8(TEST_ADDR + 1), 0xBE);
+        assert_eq!(mem.read_u8(TEST_ADDR + 2), 0xAD);
+        assert_eq!(mem.read_u8(TEST_ADDR + 3), 0xDE);
     }
 
     #[test]
@@ -122,22 +128,22 @@ mod tests {
         let mut mem = Memory::new();
         let s = b"hello\0";
         for (i, &b) in s.iter().enumerate() {
-            mem.write_u8(0x80A0_0000 + i as u32, b);
+            mem.write_u8(TEST_ADDR + i as u32, b);
         }
-        assert_eq!(mem.read_string(0x80A0_0000), "hello");
+        assert_eq!(mem.read_string(TEST_ADDR), "hello");
     }
 
     #[test]
     #[should_panic(expected = "OOB")]
     fn test_oob_below() {
         let mem = Memory::new();
-        mem.read_u8(0x7FFF_FFFF);
+        mem.read_u8(BASE.wrapping_sub(1));
     }
 
     #[test]
     #[should_panic(expected = "OOB")]
     fn test_oob_above() {
         let mem = Memory::new();
-        mem.read_u8(0xA000_0000);
+        mem.read_u8(BASE + SIZE as u32);
     }
 }

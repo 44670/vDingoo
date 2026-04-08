@@ -3,5 +3,8 @@ name = "vdingoo"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+reloc = []
+
 [dependencies]
 sdl2 = "0.37"

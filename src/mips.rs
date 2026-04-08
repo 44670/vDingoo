@@ -564,13 +564,16 @@ impl Cpu {
 mod tests {
     use super::*;
 
+    const PC: u32 = crate::mem::BASE + 0x00A0_0000;
+    const DATA: u32 = crate::mem::BASE + 0x00B0_0000;
+
     fn make_cpu_mem() -> (Cpu, Memory) {
         let mut cpu = Cpu::new();
         let mem = Memory::new();
-        cpu.pc = 0x80A0_0000;
+        cpu.pc = PC;
         cpu.next_pc = cpu.pc.wrapping_add(4);
-        cpu.code_start = 0x80A0_0000;
-        cpu.code_end = 0x80C0_0000;
+        cpu.code_start = PC;
+        cpu.code_end = PC + 0x0020_0000;
         (cpu, mem)
     }
 
@@ -847,7 +850,7 @@ mod tests {
     fn test_addiu() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 5); // $a0 = 5
-        write_insn(&mut mem, 0x80A0_0000, insn_addiu(4, 4, 10));
+        write_insn(&mut mem, PC + 0x000, insn_addiu(4, 4, 10));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(4), 15);
     }
@@ -855,20 +858,20 @@ mod tests {
     #[test]
     fn test_lui_ori() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        write_insn(&mut mem, 0x80A0_0000, insn_lui(4, 0x80A0));
-        write_insn(&mut mem, 0x80A0_0004, insn_ori(4, 4, 0x0000));
+        write_insn(&mut mem, PC, insn_lui(4, 0x1234));
+        write_insn(&mut mem, PC + 4, insn_ori(4, 4, 0x5678));
         cpu.step(&mut mem);
         cpu.step(&mut mem);
-        assert_eq!(cpu.gpr(4), 0x80A0_0000);
+        assert_eq!(cpu.gpr(4), 0x1234_5678);
     }
 
     #[test]
     fn test_sw_lw() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0xDEAD_BEEF); // value to store
-        cpu.set_gpr(5, 0x80B0_0000); // base addr
-        write_insn(&mut mem, 0x80A0_0000, insn_sw(4, 5, 0));
-        write_insn(&mut mem, 0x80A0_0004, insn_lw(6, 5, 0));
+        cpu.set_gpr(5, DATA + 0x000); // base addr
+        write_insn(&mut mem, PC + 0x000, insn_sw(4, 5, 0));
+        write_insn(&mut mem, PC + 0x004, insn_lw(6, 5, 0));
         cpu.step(&mut mem);
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(6), 0xDEAD_BEEF);
@@ -878,19 +881,19 @@ mod tests {
     fn test_branch_delay_slot() {
         let (mut cpu, mut mem) = make_cpu_mem();
         // BEQ $0, $0, +2  (always taken, target = pc+4 + 2*4 = pc+12)
-        write_insn(&mut mem, 0x80A0_0000, insn_beq(0, 0, 2));
+        write_insn(&mut mem, PC + 0x000, insn_beq(0, 0, 2));
         // Delay slot: ADDIU $a0, $zero, 42
-        write_insn(&mut mem, 0x80A0_0004, insn_addiu(4, 0, 42));
+        write_insn(&mut mem, PC + 0x004, insn_addiu(4, 0, 42));
         // Should skip this
-        write_insn(&mut mem, 0x80A0_0008, insn_addiu(5, 0, 99));
+        write_insn(&mut mem, PC + 0x008, insn_addiu(5, 0, 99));
         // Branch target
-        write_insn(&mut mem, 0x80A0_000C, 0); // NOP
+        write_insn(&mut mem, PC + 0x00C, 0); // NOP
 
         cpu.step(&mut mem); // execute BEQ (sets next_pc to target)
         cpu.step(&mut mem); // execute delay slot ADDIU
         assert_eq!(cpu.gpr(4), 42); // delay slot executed
         // PC should now be at branch target
-        assert_eq!(cpu.pc, 0x80A0_000C);
+        assert_eq!(cpu.pc, PC + 0x00C);
     }
 
     #[test]
@@ -899,27 +902,27 @@ mod tests {
         cpu.set_gpr(4, 1);
         cpu.set_gpr(5, 2);
         // BEQL $a0, $a1, +2  (not equal → not taken → nullify delay slot)
-        write_insn(&mut mem, 0x80A0_0000, insn_beql(4, 5, 2));
+        write_insn(&mut mem, PC + 0x000, insn_beql(4, 5, 2));
         // Delay slot: ADDIU $t0, $zero, 42 — should be NULLIFIED
-        write_insn(&mut mem, 0x80A0_0004, insn_addiu(8, 0, 42));
+        write_insn(&mut mem, PC + 0x004, insn_addiu(8, 0, 42));
         // Fall-through
-        write_insn(&mut mem, 0x80A0_0008, 0); // NOP
+        write_insn(&mut mem, PC + 0x008, 0); // NOP
 
         cpu.step(&mut mem); // BEQL — not taken, nullifies
         assert_eq!(cpu.gpr(8), 0); // delay slot was NOT executed
-        assert_eq!(cpu.pc, 0x80A0_0008); // fell through, skipping delay slot
+        assert_eq!(cpu.pc, PC + 0x008); // fell through, skipping delay slot
     }
 
     #[test]
     fn test_jal_ra() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        // JAL 0x80A0_0100
-        write_insn(&mut mem, 0x80A0_0000, insn_jal(0x80A0_0100));
-        write_insn(&mut mem, 0x80A0_0004, 0); // delay slot NOP
+        // JAL PC + 0x100
+        write_insn(&mut mem, PC + 0x000, insn_jal(PC + 0x100));
+        write_insn(&mut mem, PC + 0x004, 0); // delay slot NOP
         cpu.step(&mut mem); // JAL
-        assert_eq!(cpu.gpr(31), 0x80A0_0008); // $ra = pc + 8
+        assert_eq!(cpu.gpr(31), PC + 0x008); // $ra = pc + 8
         cpu.step(&mut mem); // delay slot
-        assert_eq!(cpu.pc, 0x80A0_0100); // jumped to target
+        assert_eq!(cpu.pc, PC + 0x100); // jumped to target
     }
 
     #[test]
@@ -928,7 +931,7 @@ mod tests {
         cpu.set_gpr(4, (-1i32) as u32); // -1
         cpu.set_gpr(5, 1);
         // SLT $t0, $a0, $a1 → (-1 < 1) = 1
-        write_insn(&mut mem, 0x80A0_0000, insn_slt(8, 4, 5));
+        write_insn(&mut mem, PC + 0x000, insn_slt(8, 4, 5));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 1);
     }
@@ -937,7 +940,7 @@ mod tests {
     fn test_r0_immutable() {
         let (mut cpu, mut mem) = make_cpu_mem();
         // ADDIU $zero, $zero, 42
-        write_insn(&mut mem, 0x80A0_0000, insn_addiu(0, 0, 42));
+        write_insn(&mut mem, PC + 0x000, insn_addiu(0, 0, 42));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(0), 0);
     }
@@ -945,7 +948,7 @@ mod tests {
     #[test]
     fn test_break() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        write_insn(&mut mem, 0x80A0_0000, insn_break(5));
+        write_insn(&mut mem, PC + 0x000, insn_break(5));
         match cpu.step(&mut mem) {
             StepResult::Break(code) => assert_eq!(code, 5),
             _ => panic!("Expected Break"),
@@ -972,7 +975,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0xFF00_FF00);
         cpu.set_gpr(5, 0x0F0F_0F0F);
-        let pc = 0x80A0_0000;
+        let pc = PC + 0x000;
         write_insn(&mut mem, pc,     insn_special(0x24, 8, 4, 5));  // AND
         write_insn(&mut mem, pc + 4, insn_special(0x25, 9, 4, 5));  // OR
         write_insn(&mut mem, pc + 8, insn_special(0x26, 10, 4, 5)); // XOR
@@ -992,7 +995,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 100);
         cpu.set_gpr(5, 30);
-        write_insn(&mut mem, 0x80A0_0000, insn_special(0x23, 8, 4, 5)); // SUBU
+        write_insn(&mut mem, PC + 0x000, insn_special(0x23, 8, 4, 5)); // SUBU
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 70);
     }
@@ -1002,7 +1005,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 10);
         cpu.set_gpr(5, 20);
-        write_insn(&mut mem, 0x80A0_0000, insn_special(0x23, 8, 4, 5)); // SUBU
+        write_insn(&mut mem, PC + 0x000, insn_special(0x23, 8, 4, 5)); // SUBU
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 10u32.wrapping_sub(20)); // 0xFFFF_FFF6
     }
@@ -1013,7 +1016,7 @@ mod tests {
     fn test_sll() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 1);
-        write_insn(&mut mem, 0x80A0_0000, insn_sll(8, 4, 16));
+        write_insn(&mut mem, PC + 0x000, insn_sll(8, 4, 16));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0x0001_0000);
     }
@@ -1022,7 +1025,7 @@ mod tests {
     fn test_srl() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0x8000_0000);
-        write_insn(&mut mem, 0x80A0_0000, insn_srl(8, 4, 16));
+        write_insn(&mut mem, PC + 0x000, insn_srl(8, 4, 16));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0x0000_8000); // logical shift, zero-fill
     }
@@ -1031,7 +1034,7 @@ mod tests {
     fn test_sra() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0x8000_0000); // negative number
-        write_insn(&mut mem, 0x80A0_0000, insn_sra(8, 4, 16));
+        write_insn(&mut mem, PC + 0x000, insn_sra(8, 4, 16));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0xFFFF_8000); // arithmetic shift, sign-extend
     }
@@ -1042,7 +1045,7 @@ mod tests {
         cpu.set_gpr(4, 0x0000_0001);
         cpu.set_gpr(5, 8); // shift amount
         cpu.set_gpr(6, 0xFF00_0000);
-        let pc = 0x80A0_0000;
+        let pc = PC + 0x000;
         // SLLV: rd=8, rt=4, rs=5
         write_insn(&mut mem, pc,     insn_special(0x04, 8, 5, 4));
         // SRLV: rd=9, rt=6, rs=5
@@ -1064,7 +1067,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0x0001_0000); // 65536
         cpu.set_gpr(5, 0x0001_0000); // 65536
-        let pc = 0x80A0_0000;
+        let pc = PC + 0x000;
         write_insn(&mut mem, pc,     insn_mult(4, 5));
         write_insn(&mut mem, pc + 4, insn_mflo(8));
         write_insn(&mut mem, pc + 8, insn_mfhi(9));
@@ -1081,7 +1084,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, (-3i32) as u32);
         cpu.set_gpr(5, 7);
-        let pc = 0x80A0_0000;
+        let pc = PC + 0x000;
         write_insn(&mut mem, pc,     insn_mult(4, 5));
         write_insn(&mut mem, pc + 4, insn_mflo(8));
         write_insn(&mut mem, pc + 8, insn_mfhi(9));
@@ -1098,7 +1101,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0xFFFF_FFFF);
         cpu.set_gpr(5, 2);
-        let pc = 0x80A0_0000;
+        let pc = PC + 0x000;
         write_insn(&mut mem, pc,     insn_multu(4, 5));
         write_insn(&mut mem, pc + 4, insn_mflo(8));
         write_insn(&mut mem, pc + 8, insn_mfhi(9));
@@ -1115,7 +1118,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, (-21i32) as u32);
         cpu.set_gpr(5, 4);
-        let pc = 0x80A0_0000;
+        let pc = PC + 0x000;
         write_insn(&mut mem, pc,     insn_div(4, 5));
         write_insn(&mut mem, pc + 4, insn_mflo(8));
         write_insn(&mut mem, pc + 8, insn_mfhi(9));
@@ -1131,7 +1134,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 100);
         cpu.set_gpr(5, 7);
-        let pc = 0x80A0_0000;
+        let pc = PC + 0x000;
         write_insn(&mut mem, pc,     insn_divu(4, 5));
         write_insn(&mut mem, pc + 4, insn_mflo(8));
         write_insn(&mut mem, pc + 8, insn_mfhi(9));
@@ -1149,7 +1152,7 @@ mod tests {
         cpu.set_gpr(5, 0);
         cpu.lo = 0xAAAA;
         cpu.hi = 0xBBBB;
-        write_insn(&mut mem, 0x80A0_0000, insn_div(4, 5));
+        write_insn(&mut mem, PC + 0x000, insn_div(4, 5));
         cpu.step(&mut mem);
         // Result undefined on real HW; our impl preserves hi/lo
         assert_eq!(cpu.lo, 0xAAAA);
@@ -1163,7 +1166,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 7);
         cpu.set_gpr(5, 6);
-        write_insn(&mut mem, 0x80A0_0000, insn_mul(8, 4, 5));
+        write_insn(&mut mem, PC + 0x000, insn_mul(8, 4, 5));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 42);
     }
@@ -1171,7 +1174,7 @@ mod tests {
     #[test]
     fn test_clz() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        let pc = 0x80A0_0000;
+        let pc = PC + 0x000;
         cpu.set_gpr(4, 0x0000_0001);
         write_insn(&mut mem, pc, insn_clz(8, 4));
         cpu.step(&mut mem);
@@ -1194,7 +1197,7 @@ mod tests {
     fn test_clo() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0xFFFF_FFFF);
-        write_insn(&mut mem, 0x80A0_0000, insn_clo(8, 4));
+        write_insn(&mut mem, PC + 0x000, insn_clo(8, 4));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 32);
     }
@@ -1206,7 +1209,7 @@ mod tests {
         cpu.set_gpr(5, 4);
         cpu.hi = 0;
         cpu.lo = 10;
-        write_insn(&mut mem, 0x80A0_0000, insn_madd(4, 5));
+        write_insn(&mut mem, PC + 0x000, insn_madd(4, 5));
         cpu.step(&mut mem);
         // 10 + 3*4 = 22
         assert_eq!(cpu.lo, 22);
@@ -1220,7 +1223,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0xDEAD_BEEF);
         // EXT $t0, $a0, pos=8, size=8 → extract bits [15:8] = 0xBE
-        write_insn(&mut mem, 0x80A0_0000, insn_ext(8, 4, 8, 8));
+        write_insn(&mut mem, PC + 0x000, insn_ext(8, 4, 8, 8));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0xBE);
     }
@@ -1230,7 +1233,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0xDEAD_BEEF);
         // EXT $t0, $a0, pos=0, size=16 → lower 16 bits = 0xBEEF
-        write_insn(&mut mem, 0x80A0_0000, insn_ext(8, 4, 0, 16));
+        write_insn(&mut mem, PC + 0x000, insn_ext(8, 4, 0, 16));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0xBEEF);
     }
@@ -1241,7 +1244,7 @@ mod tests {
         cpu.set_gpr(4, 0xFF);         // source
         cpu.set_gpr(8, 0x1234_5678);  // dest
         // INS $t0, $a0, lsb=8, msb=15 → insert 8 bits at pos 8
-        write_insn(&mut mem, 0x80A0_0000, insn_ins(8, 4, 8, 15));
+        write_insn(&mut mem, PC + 0x000, insn_ins(8, 4, 8, 15));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0x1234_FF78);
     }
@@ -1250,14 +1253,14 @@ mod tests {
     fn test_seb() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0x0000_0080); // 128 → -128 as signed byte
-        write_insn(&mut mem, 0x80A0_0000, insn_seb(8, 4));
+        write_insn(&mut mem, PC + 0x000, insn_seb(8, 4));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0xFFFF_FF80);
 
         // Positive byte
-        cpu.pc = 0x80A0_0000; cpu.next_pc = 0x80A0_0004;
+        cpu.pc = PC + 0x000; cpu.next_pc = PC + 0x004;
         cpu.set_gpr(4, 0xFFFF_FF7F); // 0x7F = 127
-        write_insn(&mut mem, 0x80A0_0000, insn_seb(8, 4));
+        write_insn(&mut mem, PC + 0x000, insn_seb(8, 4));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0x0000_007F);
     }
@@ -1266,7 +1269,7 @@ mod tests {
     fn test_seh() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0x0000_8000); // -32768 as i16
-        write_insn(&mut mem, 0x80A0_0000, insn_seh(8, 4));
+        write_insn(&mut mem, PC + 0x000, insn_seh(8, 4));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0xFFFF_8000);
     }
@@ -1275,7 +1278,7 @@ mod tests {
     fn test_wsbh() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0x1234_5678);
-        write_insn(&mut mem, 0x80A0_0000, insn_wsbh(8, 4));
+        write_insn(&mut mem, PC + 0x000, insn_wsbh(8, 4));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0x3412_7856);
     }
@@ -1285,9 +1288,9 @@ mod tests {
     #[test]
     fn test_lb_sign_extend() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        cpu.set_gpr(5, 0x80B0_0000);
-        mem.write_u8(0x80B0_0000, 0x80); // -128
-        write_insn(&mut mem, 0x80A0_0000, insn_lb(8, 5, 0));
+        cpu.set_gpr(5, DATA + 0x000);
+        mem.write_u8(DATA + 0x000, 0x80); // -128
+        write_insn(&mut mem, PC + 0x000, insn_lb(8, 5, 0));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0xFFFF_FF80);
     }
@@ -1295,9 +1298,9 @@ mod tests {
     #[test]
     fn test_lbu_zero_extend() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        cpu.set_gpr(5, 0x80B0_0000);
-        mem.write_u8(0x80B0_0000, 0x80);
-        write_insn(&mut mem, 0x80A0_0000, insn_lbu(8, 5, 0));
+        cpu.set_gpr(5, DATA + 0x000);
+        mem.write_u8(DATA + 0x000, 0x80);
+        write_insn(&mut mem, PC + 0x000, insn_lbu(8, 5, 0));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0x0000_0080);
     }
@@ -1305,9 +1308,9 @@ mod tests {
     #[test]
     fn test_lh_sign_extend() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        cpu.set_gpr(5, 0x80B0_0000);
-        mem.write_u16(0x80B0_0000, 0x8000);
-        write_insn(&mut mem, 0x80A0_0000, insn_lh(8, 5, 0));
+        cpu.set_gpr(5, DATA + 0x000);
+        mem.write_u16(DATA + 0x000, 0x8000);
+        write_insn(&mut mem, PC + 0x000, insn_lh(8, 5, 0));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0xFFFF_8000);
     }
@@ -1315,9 +1318,9 @@ mod tests {
     #[test]
     fn test_lhu_zero_extend() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        cpu.set_gpr(5, 0x80B0_0000);
-        mem.write_u16(0x80B0_0000, 0x8000);
-        write_insn(&mut mem, 0x80A0_0000, insn_lhu(8, 5, 0));
+        cpu.set_gpr(5, DATA + 0x000);
+        mem.write_u16(DATA + 0x000, 0x8000);
+        write_insn(&mut mem, PC + 0x000, insn_lhu(8, 5, 0));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0x0000_8000);
     }
@@ -1326,25 +1329,25 @@ mod tests {
     fn test_sb_sh() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0xDEAD_BEEF);
-        cpu.set_gpr(5, 0x80B0_0000);
-        let pc = 0x80A0_0000;
+        cpu.set_gpr(5, DATA + 0x000);
+        let pc = PC + 0x000;
         write_insn(&mut mem, pc,     insn_sb(4, 5, 0)); // store byte 0xEF
         write_insn(&mut mem, pc + 4, insn_sh(4, 5, 4)); // store half 0xBEEF at +4
         cpu.step(&mut mem);
         cpu.step(&mut mem);
-        assert_eq!(mem.read_u8(0x80B0_0000), 0xEF);
-        assert_eq!(mem.read_u16(0x80B0_0004), 0xBEEF);
+        assert_eq!(mem.read_u8(DATA + 0x000), 0xEF);
+        assert_eq!(mem.read_u16(DATA + 0x004), 0xBEEF);
     }
 
     #[test]
     fn test_load_store_negative_offset() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0xAB);
-        cpu.set_gpr(5, 0x80B0_0010); // base
-        // SB $a0, -4($a1) → store at 0x80B0_000C
-        write_insn(&mut mem, 0x80A0_0000, insn_sb(4, 5, -4i16));
+        cpu.set_gpr(5, DATA + 0x010); // base
+        // SB $a0, -4($a1) → store at DATA + 0x00C
+        write_insn(&mut mem, PC + 0x000, insn_sb(4, 5, -4i16));
         cpu.step(&mut mem);
-        assert_eq!(mem.read_u8(0x80B0_000C), 0xAB);
+        assert_eq!(mem.read_u8(DATA + 0x00C), 0xAB);
     }
 
     // ---- LWL/LWR (unaligned load) ----
@@ -1352,9 +1355,9 @@ mod tests {
     #[test]
     fn test_lwl_lwr_aligned() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        mem.write_u32(0x80B0_0000, 0xDEAD_BEEF);
-        cpu.set_gpr(5, 0x80B0_0000);
-        let pc = 0x80A0_0000;
+        mem.write_u32(DATA + 0x000, 0xDEAD_BEEF);
+        cpu.set_gpr(5, DATA + 0x000);
+        let pc = PC + 0x000;
         // LWL $t0, 3($a1)  — load full word (byte 3 = MSB for LE)
         write_insn(&mut mem, pc,     insn_lwl(8, 5, 3));
         // LWR $t0, 0($a1)  — load full word (byte 0 = LSB for LE)
@@ -1367,18 +1370,18 @@ mod tests {
     #[test]
     fn test_lwl_lwr_unaligned() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        // Store bytes: 0x80B0_0001 = 0x11, 0x80B0_0002 = 0x22, 0x80B0_0003 = 0x33, 0x80B0_0004 = 0x44
-        mem.write_u8(0x80B0_0001, 0x11);
-        mem.write_u8(0x80B0_0002, 0x22);
-        mem.write_u8(0x80B0_0003, 0x33);
-        mem.write_u8(0x80B0_0004, 0x44);
-        cpu.set_gpr(5, 0x80B0_0000);
+        // Store bytes: DATA + 0x001 = 0x11, DATA + 0x002 = 0x22, DATA + 0x003 = 0x33, DATA + 0x004 = 0x44
+        mem.write_u8(DATA + 0x001, 0x11);
+        mem.write_u8(DATA + 0x002, 0x22);
+        mem.write_u8(DATA + 0x003, 0x33);
+        mem.write_u8(DATA + 0x004, 0x44);
+        cpu.set_gpr(5, DATA + 0x000);
         cpu.set_gpr(8, 0); // clear target
-        let pc = 0x80A0_0000;
-        // Load unaligned word starting at 0x80B0_0001 (4 bytes: 0x11, 0x22, 0x33, 0x44)
-        // LWL $t0, 4($a1)  — addr = 0x80B0_0004, aligned = 0x80B0_0004, byte=0 → (old & 0x00FFFFFF) | (word << 24)
+        let pc = PC + 0x000;
+        // Load unaligned word starting at DATA + 0x001 (4 bytes: 0x11, 0x22, 0x33, 0x44)
+        // LWL $t0, 4($a1)  — addr = DATA + 0x004, aligned = DATA + 0x004, byte=0 → (old & 0x00FFFFFF) | (word << 24)
         write_insn(&mut mem, pc,     insn_lwl(8, 5, 4));
-        // LWR $t0, 1($a1)  — addr = 0x80B0_0001, aligned = 0x80B0_0000, byte=1 → (old & 0xFF000000) | (word >> 8)
+        // LWR $t0, 1($a1)  — addr = DATA + 0x001, aligned = DATA + 0x000, byte=1 → (old & 0xFF000000) | (word >> 8)
         write_insn(&mut mem, pc + 4, insn_lwr(8, 5, 1));
         cpu.step(&mut mem);
         cpu.step(&mut mem);
@@ -1392,7 +1395,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 1);
         cpu.set_gpr(5, 2);
-        let pc = 0x80A0_0000;
+        let pc = PC + 0x000;
         write_insn(&mut mem, pc,     insn_bne(4, 5, 2)); // taken
         write_insn(&mut mem, pc + 4, 0); // delay slot NOP
         write_insn(&mut mem, pc + 8, insn_addiu(8, 0, 99)); // skipped
@@ -1407,80 +1410,80 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 5);
         cpu.set_gpr(5, 5);
-        write_insn(&mut mem, 0x80A0_0000, insn_bne(4, 5, 2));
-        write_insn(&mut mem, 0x80A0_0004, 0);
+        write_insn(&mut mem, PC + 0x000, insn_bne(4, 5, 2));
+        write_insn(&mut mem, PC + 0x004, 0);
         cpu.step(&mut mem);
         cpu.step(&mut mem);
-        assert_eq!(cpu.pc, 0x80A0_0008); // fall through
+        assert_eq!(cpu.pc, PC + 0x008); // fall through
     }
 
     #[test]
     fn test_blez_taken() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0); // == 0
-        write_insn(&mut mem, 0x80A0_0000, insn_blez(4, 2));
-        write_insn(&mut mem, 0x80A0_0004, 0);
+        write_insn(&mut mem, PC + 0x000, insn_blez(4, 2));
+        write_insn(&mut mem, PC + 0x004, 0);
         cpu.step(&mut mem);
         cpu.step(&mut mem);
-        assert_eq!(cpu.pc, 0x80A0_000C);
+        assert_eq!(cpu.pc, PC + 0x00C);
 
         // Also test negative
-        cpu.pc = 0x80A0_0000; cpu.next_pc = 0x80A0_0004;
+        cpu.pc = PC + 0x000; cpu.next_pc = PC + 0x004;
         cpu.set_gpr(4, (-5i32) as u32);
         cpu.step(&mut mem);
         cpu.step(&mut mem);
-        assert_eq!(cpu.pc, 0x80A0_000C);
+        assert_eq!(cpu.pc, PC + 0x00C);
     }
 
     #[test]
     fn test_blez_not_taken() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 1); // positive
-        write_insn(&mut mem, 0x80A0_0000, insn_blez(4, 2));
-        write_insn(&mut mem, 0x80A0_0004, 0);
+        write_insn(&mut mem, PC + 0x000, insn_blez(4, 2));
+        write_insn(&mut mem, PC + 0x004, 0);
         cpu.step(&mut mem);
         cpu.step(&mut mem);
-        assert_eq!(cpu.pc, 0x80A0_0008);
+        assert_eq!(cpu.pc, PC + 0x008);
     }
 
     #[test]
     fn test_bgtz() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 1);
-        write_insn(&mut mem, 0x80A0_0000, insn_bgtz(4, 2));
-        write_insn(&mut mem, 0x80A0_0004, 0);
+        write_insn(&mut mem, PC + 0x000, insn_bgtz(4, 2));
+        write_insn(&mut mem, PC + 0x004, 0);
         cpu.step(&mut mem);
         cpu.step(&mut mem);
-        assert_eq!(cpu.pc, 0x80A0_000C); // taken
+        assert_eq!(cpu.pc, PC + 0x00C); // taken
     }
 
     #[test]
     fn test_bltz() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, (-1i32) as u32);
-        write_insn(&mut mem, 0x80A0_0000, insn_bltz(4, 2));
-        write_insn(&mut mem, 0x80A0_0004, 0);
+        write_insn(&mut mem, PC + 0x000, insn_bltz(4, 2));
+        write_insn(&mut mem, PC + 0x004, 0);
         cpu.step(&mut mem);
         cpu.step(&mut mem);
-        assert_eq!(cpu.pc, 0x80A0_000C); // taken
+        assert_eq!(cpu.pc, PC + 0x00C); // taken
 
         // Not taken: positive
-        cpu.pc = 0x80A0_0000; cpu.next_pc = 0x80A0_0004;
+        cpu.pc = PC + 0x000; cpu.next_pc = PC + 0x004;
         cpu.set_gpr(4, 0);
         cpu.step(&mut mem);
         cpu.step(&mut mem);
-        assert_eq!(cpu.pc, 0x80A0_0008); // 0 is not < 0
+        assert_eq!(cpu.pc, PC + 0x008); // 0 is not < 0
     }
 
     #[test]
     fn test_bgez() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0); // 0 >= 0
-        write_insn(&mut mem, 0x80A0_0000, insn_bgez(4, 2));
-        write_insn(&mut mem, 0x80A0_0004, 0);
+        write_insn(&mut mem, PC + 0x000, insn_bgez(4, 2));
+        write_insn(&mut mem, PC + 0x004, 0);
         cpu.step(&mut mem);
         cpu.step(&mut mem);
-        assert_eq!(cpu.pc, 0x80A0_000C); // taken
+        assert_eq!(cpu.pc, PC + 0x00C); // taken
     }
 
     #[test]
@@ -1488,11 +1491,11 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         // BEQ $0, $0, -1 (offset = -1 → target = pc+4 + (-1)*4 = pc)
         // This creates a tight loop — just verify the target
-        write_insn(&mut mem, 0x80A0_0000, insn_beq(0, 0, -1i16));
-        write_insn(&mut mem, 0x80A0_0004, 0); // delay slot
+        write_insn(&mut mem, PC + 0x000, insn_beq(0, 0, -1i16));
+        write_insn(&mut mem, PC + 0x004, 0); // delay slot
         cpu.step(&mut mem); // BEQ
         cpu.step(&mut mem); // delay slot
-        assert_eq!(cpu.pc, 0x80A0_0000); // looped back
+        assert_eq!(cpu.pc, PC + 0x000); // looped back
     }
 
     // ---- Jumps ----
@@ -1500,35 +1503,35 @@ mod tests {
     #[test]
     fn test_j() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        write_insn(&mut mem, 0x80A0_0000, insn_j(0x80A0_0100));
-        write_insn(&mut mem, 0x80A0_0004, 0); // delay slot
+        write_insn(&mut mem, PC + 0x000, insn_j(PC + 0x100));
+        write_insn(&mut mem, PC + 0x004, 0); // delay slot
         cpu.step(&mut mem);
         cpu.step(&mut mem);
-        assert_eq!(cpu.pc, 0x80A0_0100);
+        assert_eq!(cpu.pc, PC + 0x100);
     }
 
     #[test]
     fn test_jr() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        cpu.set_gpr(31, 0x80A0_0200); // $ra
-        write_insn(&mut mem, 0x80A0_0000, insn_jr(31));
-        write_insn(&mut mem, 0x80A0_0004, 0);
+        cpu.set_gpr(31, PC + 0x200); // $ra
+        write_insn(&mut mem, PC + 0x000, insn_jr(31));
+        write_insn(&mut mem, PC + 0x004, 0);
         cpu.step(&mut mem);
         cpu.step(&mut mem);
-        assert_eq!(cpu.pc, 0x80A0_0200);
+        assert_eq!(cpu.pc, PC + 0x200);
     }
 
     #[test]
     fn test_jalr() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        cpu.set_gpr(4, 0x80A0_0300);
+        cpu.set_gpr(4, PC + 0x300);
         // JALR $t0, $a0  (rd=8, rs=4)
-        write_insn(&mut mem, 0x80A0_0000, (4 << 21) | (8 << 11) | 0x09);
-        write_insn(&mut mem, 0x80A0_0004, 0);
+        write_insn(&mut mem, PC + 0x000, (4 << 21) | (8 << 11) | 0x09);
+        write_insn(&mut mem, PC + 0x004, 0);
         cpu.step(&mut mem);
-        assert_eq!(cpu.gpr(8), 0x80A0_0008); // link = pc + 8
+        assert_eq!(cpu.gpr(8), PC + 0x008); // link = pc + 8
         cpu.step(&mut mem);
-        assert_eq!(cpu.pc, 0x80A0_0300);
+        assert_eq!(cpu.pc, PC + 0x300);
     }
 
     // ---- Immediate ALU ----
@@ -1536,11 +1539,11 @@ mod tests {
     #[test]
     fn test_addiu_sign_extend() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        cpu.set_gpr(4, 0x80A0_0000);
+        cpu.set_gpr(4, PC);
         // ADDIU $a0, $a0, -4 (0xFFFC)
-        write_insn(&mut mem, 0x80A0_0000, insn_addiu(4, 4, 0xFFFC));
+        write_insn(&mut mem, PC, insn_addiu(4, 4, 0xFFFC));
         cpu.step(&mut mem);
-        assert_eq!(cpu.gpr(4), 0x809F_FFFC);
+        assert_eq!(cpu.gpr(4), PC.wrapping_sub(4));
     }
 
     #[test]
@@ -1548,7 +1551,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0xFFFF_FFFF);
         // ANDI $t0, $a0, 0xFF00  — zero-extended, NOT sign-extended
-        write_insn(&mut mem, 0x80A0_0000, insn_andi(8, 4, 0xFF00));
+        write_insn(&mut mem, PC + 0x000, insn_andi(8, 4, 0xFF00));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0x0000_FF00);
     }
@@ -1557,7 +1560,7 @@ mod tests {
     fn test_xori() {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 0x0000_00FF);
-        write_insn(&mut mem, 0x80A0_0000, insn_xori(8, 4, 0x00FF));
+        write_insn(&mut mem, PC + 0x000, insn_xori(8, 4, 0x00FF));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 0); // 0xFF ^ 0xFF = 0
     }
@@ -1567,7 +1570,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, (-5i32) as u32);
         // SLTI $t0, $a0, 0 → (-5 < 0) = 1
-        write_insn(&mut mem, 0x80A0_0000, insn_slti(8, 4, 0));
+        write_insn(&mut mem, PC + 0x000, insn_slti(8, 4, 0));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 1);
     }
@@ -1577,7 +1580,7 @@ mod tests {
         let (mut cpu, mut mem) = make_cpu_mem();
         cpu.set_gpr(4, 5);
         // SLTIU $t0, $a0, 10 → (5 < 10) = 1
-        write_insn(&mut mem, 0x80A0_0000, insn_sltiu(8, 4, 10));
+        write_insn(&mut mem, PC + 0x000, insn_sltiu(8, 4, 10));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 1);
     }
@@ -1588,7 +1591,7 @@ mod tests {
         cpu.set_gpr(4, 0xFFFF_FFFF); // huge unsigned
         cpu.set_gpr(5, 1);
         // SLTU $t0, $a1, $a0 → (1 < 0xFFFFFFFF) = 1
-        write_insn(&mut mem, 0x80A0_0000, insn_sltu(8, 5, 4));
+        write_insn(&mut mem, PC + 0x000, insn_sltu(8, 5, 4));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 1);
     }
@@ -1601,11 +1604,11 @@ mod tests {
         cpu.set_gpr(4, 42);
         cpu.set_gpr(5, 0); // zero → move
         cpu.set_gpr(8, 99);
-        write_insn(&mut mem, 0x80A0_0000, insn_movz(8, 4, 5));
+        write_insn(&mut mem, PC + 0x000, insn_movz(8, 4, 5));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 42); // moved
 
-        cpu.pc = 0x80A0_0000; cpu.next_pc = 0x80A0_0004;
+        cpu.pc = PC + 0x000; cpu.next_pc = PC + 0x004;
         cpu.set_gpr(5, 1); // non-zero → don't move
         cpu.set_gpr(8, 99);
         cpu.step(&mut mem);
@@ -1618,11 +1621,11 @@ mod tests {
         cpu.set_gpr(4, 42);
         cpu.set_gpr(5, 1); // non-zero → move
         cpu.set_gpr(8, 99);
-        write_insn(&mut mem, 0x80A0_0000, insn_movn(8, 4, 5));
+        write_insn(&mut mem, PC + 0x000, insn_movn(8, 4, 5));
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 42);
 
-        cpu.pc = 0x80A0_0000; cpu.next_pc = 0x80A0_0004;
+        cpu.pc = PC + 0x000; cpu.next_pc = PC + 0x004;
         cpu.set_gpr(5, 0); // zero → don't move
         cpu.set_gpr(8, 99);
         cpu.step(&mut mem);
@@ -1634,9 +1637,9 @@ mod tests {
     #[test]
     fn test_ll_sc() {
         let (mut cpu, mut mem) = make_cpu_mem();
-        cpu.set_gpr(5, 0x80B0_0000);
-        mem.write_u32(0x80B0_0000, 0x1234_5678);
-        let pc = 0x80A0_0000;
+        cpu.set_gpr(5, DATA + 0x000);
+        mem.write_u32(DATA + 0x000, 0x1234_5678);
+        let pc = PC + 0x000;
         write_insn(&mut mem, pc,     insn_ll(8, 5, 0));      // LL $t0, 0($a1)
         write_insn(&mut mem, pc + 4, insn_addiu(8, 8, 1));    // $t0 += 1
         write_insn(&mut mem, pc + 8, insn_sc(8, 5, 0));       // SC $t0, 0($a1)
@@ -1646,7 +1649,7 @@ mod tests {
         assert_eq!(cpu.gpr(8), 0x1234_5679);
         cpu.step(&mut mem);
         assert_eq!(cpu.gpr(8), 1); // SC success
-        assert_eq!(mem.read_u32(0x80B0_0000), 0x1234_5679);
+        assert_eq!(mem.read_u32(DATA + 0x000), 0x1234_5679);
     }
 
     // ---- Insn count ----
@@ -1655,9 +1658,9 @@ mod tests {
     fn test_insn_count() {
         let (mut cpu, mut mem) = make_cpu_mem();
         assert_eq!(cpu.insn_count, 0);
-        write_insn(&mut mem, 0x80A0_0000, 0); // NOP
-        write_insn(&mut mem, 0x80A0_0004, 0);
-        write_insn(&mut mem, 0x80A0_0008, 0);
+        write_insn(&mut mem, PC + 0x000, 0); // NOP
+        write_insn(&mut mem, PC + 0x004, 0);
+        write_insn(&mut mem, PC + 0x008, 0);
         cpu.step(&mut mem);
         cpu.step(&mut mem);
         cpu.step(&mut mem);
@@ -1670,7 +1673,7 @@ mod tests {
     fn test_loop_sum() {
         // Sum 1+2+3+4+5 using a loop
         let (mut cpu, mut mem) = make_cpu_mem();
-        let pc = 0x80A0_0000;
+        let pc = PC + 0x000;
         // $a0 = counter (5), $v0 = sum (0), $a1 = 1 (decrement)
         cpu.set_gpr(4, 5); // counter
         cpu.set_gpr(2, 0); // sum
@@ -1696,24 +1699,24 @@ mod tests {
     fn test_jal_jr_call_return() {
         // Simulate a function call and return
         let (mut cpu, mut mem) = make_cpu_mem();
-        let pc = 0x80A0_0000;
+        let pc = PC + 0x000;
         // caller:
         //   addiu $a0, $zero, 10
-        //   jal 0x80A0_0100
+        //   jal PC + 0x100
         //   nop (delay slot)
         //   addiu $a1, $v0, 0     ; $a1 = return value
         write_insn(&mut mem, pc,      insn_addiu(4, 0, 10));
-        write_insn(&mut mem, pc + 4,  insn_jal(0x80A0_0100));
+        write_insn(&mut mem, pc + 4,  insn_jal(PC + 0x100));
         write_insn(&mut mem, pc + 8,  0); // delay slot
         write_insn(&mut mem, pc + 12, insn_addiu(5, 2, 0)); // $a1 = $v0
 
-        // callee at 0x80A0_0100: double the argument
+        // callee at PC + 0x100: double the argument
         //   addu $v0, $a0, $a0
         //   jr $ra
         //   nop
-        write_insn(&mut mem, 0x80A0_0100, insn_special(0x21, 2, 4, 4)); // ADDU $v0, $a0, $a0
-        write_insn(&mut mem, 0x80A0_0104, insn_jr(31));
-        write_insn(&mut mem, 0x80A0_0108, 0);
+        write_insn(&mut mem, PC + 0x100, insn_special(0x21, 2, 4, 4)); // ADDU $v0, $a0, $a0
+        write_insn(&mut mem, PC + 0x104, insn_jr(31));
+        write_insn(&mut mem, PC + 0x108, 0);
 
         // Execute: addiu, jal, delay, addu, jr, delay, addiu
         for _ in 0..7 {

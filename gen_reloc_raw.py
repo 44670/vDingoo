@@ -24,8 +24,20 @@ DATA_SIZE   = 0x13A2E0
 MEM_SIZE    = 0x144880
 END_ADDR    = LOAD_ADDR + MEM_SIZE
 
+# 7 known false positives: lb/lbu instructions whose encoding looks like pointers
+# See QIYE_RELOC_FP.md for details
+DATA32_FALSE_POSITIVES = {
+    0x80A0155C,  # lb $a3, 0($a1) in strstr
+    0x80A01834,  # lb $s0, 0($a1) in sscanf
+    0x80A03664,  # lb $v0, 0($a1) in sprintf
+    0x80A037E4,  # lb $v0, 0($a1) in sprintf
+    0x80A0DF48,  # lb $v0, 0x6b($a1) in Scene_updateTrigger
+    0x80A41930,  # lb $v0, 0x68($a1) in GameUnit_updateVisibility
+    0x80AD97D8,  # lb $v0, 0($a1) in hashString
+}
+
 def in_range(addr):
-    return LOAD_ADDR <= addr < END_ADDR
+    return LOAD_ADDR <= addr <= END_ADDR
 
 def read_u32(data, off):
     return struct.unpack_from('<I', data, off)[0]
@@ -113,6 +125,18 @@ def scan_instructions(code):
             try_pair(RELOC_LO16_STORE, lambda hi: hi + get_imm16s(inst))
             continue
 
+        # addu/add (R-type): lui $r, hi; addu $r, $r, $idx — page base + register index.
+        # Only the lui needs relocation; the lo16 comes from a register, not an immediate.
+        if opcode == 0x00 and (inst & 0x3F) in (0x20, 0x21):  # ADD/ADDU
+            func_rs = rs
+            if func_rs in hi16_pending:
+                hi_addr, hi_val = hi16_pending[func_rs]
+                if in_range(hi_val):
+                    relocs.append((hi_addr, RELOC_HI16, hi_val))
+                    hi16_addrs.add(hi_addr)
+                del hi16_pending[func_rs]
+            continue
+
         if rs in hi16_pending:
             del hi16_pending[rs]
 
@@ -129,6 +153,8 @@ def scan_data_pointers(code, inst_addrs):
     for off in range(0, DATA_SIZE, 4):
         addr = LOAD_ADDR + off
         if addr in inst_addrs:
+            continue
+        if addr in DATA32_FALSE_POSITIVES:
             continue
         val = read_u32(code, off)
         if in_range(val):

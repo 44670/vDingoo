@@ -16,10 +16,25 @@ use std::time::Instant;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
+#[cfg(not(feature = "reloc"))]
 const HLE_BASE: u32 = 0x8000_0000;
+#[cfg(feature = "reloc")]
+const HLE_BASE: u32 = 0x0800_0000;
+
+#[cfg(not(feature = "reloc"))]
 const LCD_FRAMEBUF: u32 = 0x80F0_0000;
-const LOCALE_ANSI_BUF: u32 = 0x8001_2000; // static buffer for __to_locale_ansi
-const UNICODE_LE_BUF: u32 = 0x8001_3000;  // static buffer for __to_unicode_le
+#[cfg(feature = "reloc")]
+const LCD_FRAMEBUF: u32 = 0x08F0_0000;
+
+#[cfg(not(feature = "reloc"))]
+const LOCALE_ANSI_BUF: u32 = 0x8001_2000;
+#[cfg(feature = "reloc")]
+const LOCALE_ANSI_BUF: u32 = 0x0801_2000;
+
+#[cfg(not(feature = "reloc"))]
+const UNICODE_LE_BUF: u32 = 0x8001_3000;
+#[cfg(feature = "reloc")]
+const UNICODE_LE_BUF: u32 = 0x0801_3000;
 const LCD_W: u32 = 320;
 const LCD_H: u32 = 240;
 
@@ -114,7 +129,7 @@ impl HleState {
         let mut state = Self {
             handlers: Vec::new(),
             names: Vec::new(),
-            heap_ptr: 0x9800_0000,
+            heap_ptr: HLE_BASE + 0x1800_0000,
             alloc_sizes: HashMap::new(),
             sem_counter: 0,
             framebuf_addr: LCD_FRAMEBUF,
@@ -419,6 +434,29 @@ pub fn dispatch(ctx: &mut EmuCtx, idx: usize) {
     // Return to caller
     ctx.cpu.pc = ctx.cpu.gpr(31);
     ctx.cpu.next_pc = ctx.cpu.pc.wrapping_add(4);
+
+    // Preemptive scheduling: if a higher-priority task is ready (or a
+    // sleeping task just woke up), switch to it (matches uC/OS-II).
+    if ctx.hle.tasks.len() > 1 {
+        let cur_prio = ctx.hle.tasks[ctx.hle.current_task].priority;
+        let now = ctx.hle.current_tick();
+        let mut need_preempt = false;
+        for t in &mut ctx.hle.tasks {
+            if let TaskStatus::Sleeping(wake_at) = t.status {
+                if now >= wake_at {
+                    t.status = TaskStatus::Ready;
+                }
+            }
+            if t.status == TaskStatus::Ready && t.priority < cur_prio {
+                need_preempt = true;
+            }
+        }
+        if need_preempt {
+            let tid = ctx.hle.current_task;
+            ctx.hle.tasks[tid].status = TaskStatus::Ready;
+            ctx.hle.schedule(ctx.cpu);
+        }
+    }
 }
 
 // ── HLE Handlers ────────────────────────────────────────────────────────────
@@ -493,7 +531,7 @@ fn hle_sprintf(ctx: &mut EmuCtx) {
 
 fn hle_fprintf(ctx: &mut EmuCtx) {
     let fmt_addr = ctx.cpu.gpr(5);
-    if fmt_addr < 0x8000_0000 || fmt_addr >= 0xA000_0000 {
+    if fmt_addr < HLE_BASE || fmt_addr >= HLE_BASE + 0x2000_0000 {
         ctx.cpu.set_gpr(2, 0);
         return;
     }
@@ -738,7 +776,7 @@ fn hle_get_game_vol(ctx: &mut EmuCtx) {
 fn hle_ossem_create(ctx: &mut EmuCtx) {
     let count = ctx.cpu.gpr(4) as i32;
     ctx.hle.sem_counter += 1;
-    let addr = 0x80E0_0000 + ctx.hle.sem_counter * 4;
+    let addr = HLE_BASE + 0x00E0_0000 + ctx.hle.sem_counter * 4;
     ctx.hle.semaphores.insert(addr, Semaphore { count });
     eprintln!("[TASK] OSSemCreate(count={}) → 0x{:08x}", count, addr);
     ctx.cpu.set_gpr(2, addr);
@@ -952,7 +990,7 @@ fn hle_waveout_can_write(ctx: &mut EmuCtx) {
         let queued = queue.size();
         ctx.cpu.set_gpr(2, if queued < WAVEOUT_MAX_QUEUE { 1 } else { 0 });
     } else {
-        ctx.cpu.set_gpr(2, 1);
+        ctx.cpu.set_gpr(2, 0);
     }
 }
 
@@ -1152,15 +1190,15 @@ mod tests {
     use crate::mem::Memory;
     use crate::mips::Cpu;
 
-    const FMT_ADDR: u32 = 0x8002_0000;
-    const STR_ADDR: u32 = 0x8002_1000;
+    const FMT_ADDR: u32 = HLE_BASE + 0x0002_0000;
+    const STR_ADDR: u32 = HLE_BASE + 0x0002_1000;
 
     /// Set up CPU + Memory with a format string and up to 8 varargs.
     /// Returns the formatted result using first_arg=0 (args start at $a0).
     fn fmt(format: &str, args: &[u32]) -> String {
         let mut mem = Memory::new();
         let mut cpu = Cpu::new();
-        cpu.set_gpr(29, 0x8001_0000); // $sp
+        cpu.set_gpr(29, HLE_BASE + 0x0001_0000); // $sp
 
         // Write format string
         for (i, b) in format.bytes().enumerate() {
@@ -1189,7 +1227,7 @@ mod tests {
     fn fmt_with_str(format: &str, s: &str, args: &[u32]) -> String {
         let mut mem = Memory::new();
         let mut cpu = Cpu::new();
-        cpu.set_gpr(29, 0x8001_0000);
+        cpu.set_gpr(29, HLE_BASE + 0x0001_0000);
 
         // Write format string
         for (i, b) in format.bytes().enumerate() {
@@ -1391,7 +1429,7 @@ mod tests {
         // %.*s: arg0 = precision (3), arg1 = string pointer
         let mut mem = Memory::new();
         let mut cpu = Cpu::new();
-        cpu.set_gpr(29, 0x8001_0000);
+        cpu.set_gpr(29, HLE_BASE + 0x0001_0000);
         for (i, b) in b"%.*s".iter().enumerate() {
             mem.write_u8(FMT_ADDR + i as u32, *b);
         }
@@ -1418,7 +1456,7 @@ mod tests {
         HleState {
             handlers: Vec::new(),
             names: Vec::new(),
-            heap_ptr: 0x9800_0000,
+            heap_ptr: HLE_BASE + 0x1800_0000,
             alloc_sizes: HashMap::new(),
             sem_counter: 0,
             framebuf_addr: LCD_FRAMEBUF,
@@ -1434,19 +1472,22 @@ mod tests {
         }
     }
 
+    const T_CODE: u32 = HLE_BASE + 0x00A0_0000;
+    const T_SP: u32 = HLE_BASE + 0x0001_0000;
+
     #[test]
     fn test_init_main_task() {
         let mut hle = make_hle();
         let mut cpu = Cpu::new();
-        cpu.pc = 0x80A0_01A4;
-        cpu.next_pc = 0x80A0_01A8;
-        cpu.set_gpr(29, 0x8001_0000);
+        cpu.pc = T_CODE + 0x01A4;
+        cpu.next_pc = T_CODE + 0x01A8;
+        cpu.set_gpr(29, T_SP);
         hle.init_main_task(&cpu);
 
         assert_eq!(hle.tasks.len(), 1);
         assert_eq!(hle.tasks[0].priority, 0);
         assert_eq!(hle.tasks[0].status, TaskStatus::Running);
-        assert_eq!(hle.tasks[0].state.pc, 0x80A0_01A4);
+        assert_eq!(hle.tasks[0].state.pc, T_CODE + 0x01A4);
         assert_eq!(hle.current_task, 0);
     }
 
@@ -1454,19 +1495,18 @@ mod tests {
     fn test_task_create() {
         let mut hle = make_hle();
         let mut cpu = Cpu::new();
-        cpu.pc = 0x80A0_0100;
-        cpu.next_pc = 0x80A0_0104;
+        cpu.pc = T_CODE + 0x0100;
+        cpu.next_pc = T_CODE + 0x0104;
         hle.init_main_task(&cpu);
 
-        // Simulate OSTaskCreate(fn=0x80A47770, arg=0x9800_1000, stack=0x80B4_472C, prio=16)
-        cpu.set_gpr(4, 0x80A4_7770); // fn
-        cpu.set_gpr(5, 0x9800_1000); // arg
-        cpu.set_gpr(6, 0x80B4_472C); // stack top
-        cpu.set_gpr(7, 16);          // priority
+        let task_fn = T_CODE + 0x4_7770;
+        let task_arg = HLE_BASE + 0x1800_1000;
+        let stack_top = HLE_BASE + 0x00B4_472C;
+        cpu.set_gpr(4, task_fn);
+        cpu.set_gpr(5, task_arg);
+        cpu.set_gpr(6, stack_top);
+        cpu.set_gpr(7, 16);
 
-        let task_fn = cpu.gpr(4);
-        let task_arg = cpu.gpr(5);
-        let stack_top = cpu.gpr(6);
         let prio = (cpu.gpr(7) & 0xFF) as u8;
 
         let mut state = SavedCpuState {
@@ -1489,10 +1529,10 @@ mod tests {
         assert_eq!(hle.tasks.len(), 2);
         assert_eq!(hle.tasks[1].priority, 16);
         assert_eq!(hle.tasks[1].status, TaskStatus::Ready);
-        assert_eq!(hle.tasks[1].state.pc, 0x80A4_7770);
-        assert_eq!(hle.tasks[1].state.gpr[4], 0x9800_1000); // $a0 = arg
-        assert_eq!(hle.tasks[1].state.gpr[29], 0x80B4_472C); // $sp
-        assert_eq!(hle.tasks[1].state.gpr[31], TASK_SENTINEL); // $ra
+        assert_eq!(hle.tasks[1].state.pc, task_fn);
+        assert_eq!(hle.tasks[1].state.gpr[4], task_arg);
+        assert_eq!(hle.tasks[1].state.gpr[29], stack_top);
+        assert_eq!(hle.tasks[1].state.gpr[31], TASK_SENTINEL);
     }
 
     #[test]
@@ -1501,10 +1541,10 @@ mod tests {
 
         // Create semaphore with count=1
         hle.sem_counter += 1;
-        let addr = 0x80E0_0000 + hle.sem_counter * 4;
+        let addr = HLE_BASE + 0x00E0_0000 + hle.sem_counter * 4;
         hle.semaphores.insert(addr, Semaphore { count: 1 });
 
-        assert_eq!(addr, 0x80E0_0004);
+        assert_eq!(addr, HLE_BASE + 0x00E0_0004);
         assert_eq!(hle.semaphores[&addr].count, 1);
     }
 
@@ -1513,7 +1553,7 @@ mod tests {
         let mut hle = make_hle();
 
         // Create sem with count=1
-        let sem_addr = 0x80E0_0004;
+        let sem_addr = HLE_BASE + 0x00E0_0004;
         hle.semaphores.insert(sem_addr, Semaphore { count: 1 });
 
         // Pend — should decrement and return immediately
@@ -1527,20 +1567,20 @@ mod tests {
     fn test_semaphore_post_wakes_waiter() {
         let mut hle = make_hle();
         let mut cpu = Cpu::new();
-        cpu.pc = 0x80A0_0100;
-        cpu.next_pc = 0x80A0_0104;
+        cpu.pc = T_CODE + 0x0100;
+        cpu.next_pc = T_CODE + 0x0104;
         hle.init_main_task(&cpu);
 
         // Create a second task that's waiting on a semaphore
-        let sem_addr = 0x80E0_0004;
+        let sem_addr = HLE_BASE + 0x00E0_0004;
         hle.semaphores.insert(sem_addr, Semaphore { count: 0 });
         hle.tasks.push(Task {
             status: TaskStatus::WaitSem(sem_addr),
             priority: 16,
             state: SavedCpuState {
                 gpr: [0; 32],
-                pc: 0x80A4_7800,
-                next_pc: 0x80A4_7804,
+                pc: T_CODE + 0x4_7800,
+                next_pc: T_CODE + 0x4_7804,
                 hi: 0,
                 lo: 0,
             },
@@ -1571,9 +1611,9 @@ mod tests {
     fn test_schedule_picks_highest_priority() {
         let mut hle = make_hle();
         let mut cpu = Cpu::new();
-        cpu.pc = 0x80A0_0100;
-        cpu.next_pc = 0x80A0_0104;
-        cpu.set_gpr(29, 0x8001_0000);
+        cpu.pc = T_CODE + 0x0100;
+        cpu.next_pc = T_CODE + 0x0104;
+        cpu.set_gpr(29, T_SP);
         hle.init_main_task(&cpu);
 
         // Add two ready tasks with different priorities
@@ -1582,8 +1622,8 @@ mod tests {
             priority: 20,
             state: SavedCpuState {
                 gpr: [0; 32],
-                pc: 0x80A4_0000,
-                next_pc: 0x80A4_0004,
+                pc: T_CODE + 0x4_0000,
+                next_pc: T_CODE + 0x4_0004,
                 hi: 0,
                 lo: 0,
             },
@@ -1593,8 +1633,8 @@ mod tests {
             priority: 10,
             state: SavedCpuState {
                 gpr: [0; 32],
-                pc: 0x80A5_0000,
-                next_pc: 0x80A5_0004,
+                pc: T_CODE + 0x5_0000,
+                next_pc: T_CODE + 0x5_0004,
                 hi: 0,
                 lo: 0,
             },
@@ -1606,7 +1646,7 @@ mod tests {
 
         // Should pick task 2 (priority 10, lowest = highest priority)
         assert_eq!(hle.current_task, 2);
-        assert_eq!(cpu.pc, 0x80A5_0000);
+        assert_eq!(cpu.pc, T_CODE + 0x5_0000);
         assert_eq!(hle.tasks[2].status, TaskStatus::Running);
     }
 
@@ -1614,9 +1654,9 @@ mod tests {
     fn test_schedule_skips_dead_tasks() {
         let mut hle = make_hle();
         let mut cpu = Cpu::new();
-        cpu.pc = 0x80A0_0100;
-        cpu.next_pc = 0x80A0_0104;
-        cpu.set_gpr(29, 0x8001_0000);
+        cpu.pc = T_CODE + 0x0100;
+        cpu.next_pc = T_CODE + 0x0104;
+        cpu.set_gpr(29, T_SP);
         hle.init_main_task(&cpu);
 
         // Add a dead task and a ready task
@@ -1636,8 +1676,8 @@ mod tests {
             priority: 10,
             state: SavedCpuState {
                 gpr: [0; 32],
-                pc: 0x80A5_0000,
-                next_pc: 0x80A5_0004,
+                pc: T_CODE + 0x5_0000,
+                next_pc: T_CODE + 0x5_0004,
                 hi: 0,
                 lo: 0,
             },
@@ -1648,16 +1688,16 @@ mod tests {
 
         // Should pick task 2, skipping the dead task 1
         assert_eq!(hle.current_task, 2);
-        assert_eq!(cpu.pc, 0x80A5_0000);
+        assert_eq!(cpu.pc, T_CODE + 0x5_0000);
     }
 
     #[test]
     fn test_task_returned_marks_dead() {
         let mut hle = make_hle();
         let mut cpu = Cpu::new();
-        cpu.pc = 0x80A0_0100;
-        cpu.next_pc = 0x80A0_0104;
-        cpu.set_gpr(29, 0x8001_0000);
+        cpu.pc = T_CODE + 0x0100;
+        cpu.next_pc = T_CODE + 0x0104;
+        cpu.set_gpr(29, T_SP);
         hle.init_main_task(&cpu);
 
         // Add a second task (currently running)
@@ -1666,8 +1706,8 @@ mod tests {
             priority: 16,
             state: SavedCpuState {
                 gpr: [0; 32],
-                pc: 0x80A4_7770,
-                next_pc: 0x80A4_7774,
+                pc: T_CODE + 0x4_7770,
+                next_pc: T_CODE + 0x4_7774,
                 hi: 0,
                 lo: 0,
             },
@@ -1689,10 +1729,10 @@ mod tests {
         let mut cpu = Cpu::new();
 
         // Set up task 0 with distinctive register values
-        cpu.pc = 0x80A0_0100;
-        cpu.next_pc = 0x80A0_0104;
+        cpu.pc = T_CODE + 0x0100;
+        cpu.next_pc = T_CODE + 0x0104;
         cpu.set_gpr(4, 0x1111);
-        cpu.set_gpr(29, 0x8001_0000);
+        cpu.set_gpr(29, T_SP);
         cpu.hi = 0xAAAA;
         cpu.lo = 0xBBBB;
         hle.init_main_task(&cpu);
@@ -1700,14 +1740,14 @@ mod tests {
         // Add task 1 with different register values
         let mut t1_gpr = [0u32; 32];
         t1_gpr[4] = 0x2222;
-        t1_gpr[29] = 0x80B4_472C;
+        t1_gpr[29] = HLE_BASE + 0x00B4_472C;
         hle.tasks.push(Task {
             status: TaskStatus::Ready,
             priority: 16,
             state: SavedCpuState {
                 gpr: t1_gpr,
-                pc: 0x80A4_7770,
-                next_pc: 0x80A4_7774,
+                pc: T_CODE + 0x4_7770,
+                next_pc: T_CODE + 0x4_7774,
                 hi: 0xCCCC,
                 lo: 0xDDDD,
             },
@@ -1719,14 +1759,14 @@ mod tests {
 
         // CPU should now have task 1's state
         assert_eq!(hle.current_task, 1);
-        assert_eq!(cpu.pc, 0x80A4_7770);
+        assert_eq!(cpu.pc, T_CODE + 0x4_7770);
         assert_eq!(cpu.gpr(4), 0x2222);
-        assert_eq!(cpu.gpr(29), 0x80B4_472C);
+        assert_eq!(cpu.gpr(29), HLE_BASE + 0x00B4_472C);
         assert_eq!(cpu.hi, 0xCCCC);
         assert_eq!(cpu.lo, 0xDDDD);
 
         // Task 0's state should be saved
-        assert_eq!(hle.tasks[0].state.pc, 0x80A0_0100);
+        assert_eq!(hle.tasks[0].state.pc, T_CODE + 0x0100);
         assert_eq!(hle.tasks[0].state.gpr[4], 0x1111);
         assert_eq!(hle.tasks[0].state.hi, 0xAAAA);
         assert_eq!(hle.tasks[0].state.lo, 0xBBBB);
@@ -1736,13 +1776,13 @@ mod tests {
     fn test_semaphore_pend_blocks_and_post_wakes() {
         let mut hle = make_hle();
         let mut cpu = Cpu::new();
-        cpu.pc = 0x80A0_0100;
-        cpu.next_pc = 0x80A0_0104;
-        cpu.set_gpr(29, 0x8001_0000);
+        cpu.pc = T_CODE + 0x0100;
+        cpu.next_pc = T_CODE + 0x0104;
+        cpu.set_gpr(29, T_SP);
         hle.init_main_task(&cpu);
 
         // Create sem with count=0
-        let sem_addr = 0x80E0_0004;
+        let sem_addr = HLE_BASE + 0x00E0_0004;
         hle.semaphores.insert(sem_addr, Semaphore { count: 0 });
 
         // Task 1 waiting on this sem
@@ -1751,8 +1791,8 @@ mod tests {
             priority: 16,
             state: SavedCpuState {
                 gpr: [0; 32],
-                pc: 0x80A4_7800,
-                next_pc: 0x80A4_7804,
+                pc: T_CODE + 0x4_7800,
+                next_pc: T_CODE + 0x4_7804,
                 hi: 0,
                 lo: 0,
             },
@@ -1782,16 +1822,16 @@ mod tests {
     #[test]
     fn test_sem_del_wakes_all_waiters() {
         let mut hle = make_hle();
-        let sem_addr = 0x80E0_0008;
+        let sem_addr = HLE_BASE + 0x00E0_0008;
         hle.semaphores.insert(sem_addr, Semaphore { count: 0 });
 
         let mut cpu = Cpu::new();
-        cpu.pc = 0x80A0_0100;
-        cpu.next_pc = 0x80A0_0104;
+        cpu.pc = T_CODE + 0x0100;
+        cpu.next_pc = T_CODE + 0x0104;
         hle.init_main_task(&cpu);
 
         // Two tasks waiting on the same sem
-        for pc in [0x80A4_0000u32, 0x80A5_0000] {
+        for pc in [T_CODE + 0x4_0000, T_CODE + 0x5_0000] {
             hle.tasks.push(Task {
                 status: TaskStatus::WaitSem(sem_addr),
                 priority: 16,
@@ -1822,8 +1862,8 @@ mod tests {
     fn test_task_del_by_priority() {
         let mut hle = make_hle();
         let mut cpu = Cpu::new();
-        cpu.pc = 0x80A0_0100;
-        cpu.next_pc = 0x80A0_0104;
+        cpu.pc = T_CODE + 0x0100;
+        cpu.next_pc = T_CODE + 0x0104;
         hle.init_main_task(&cpu);
 
         hle.tasks.push(Task {
@@ -1831,8 +1871,8 @@ mod tests {
             priority: 16,
             state: SavedCpuState {
                 gpr: [0; 32],
-                pc: 0x80A4_7770,
-                next_pc: 0x80A4_7774,
+                pc: T_CODE + 0x4_7770,
+                next_pc: T_CODE + 0x4_7774,
                 hi: 0,
                 lo: 0,
             },

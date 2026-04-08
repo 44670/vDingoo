@@ -6,7 +6,10 @@ mod mips;
 
 use fs::GuestFs;
 use hle::{dispatch, EmuCtx, HleState, SdlState};
+#[cfg(not(feature = "reloc"))]
 use loader::load_ccdl;
+#[cfg(feature = "reloc")]
+use loader::load_ccdl_relocated;
 use mem::Memory;
 use mips::{Cpu, StepResult};
 
@@ -15,8 +18,16 @@ use std::path::PathBuf;
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const SENTINEL_RA: u32 = 0xDEAD_0000;
+
+#[cfg(not(feature = "reloc"))]
 const DEFAULT_SP: u32 = 0x8001_0000;
-const SCRATCH_ADDR: u32 = 0x8001_1000; // scratch area for writing strings etc.
+#[cfg(feature = "reloc")]
+const DEFAULT_SP: u32 = 0x0801_0000;
+
+#[cfg(not(feature = "reloc"))]
+const SCRATCH_ADDR: u32 = 0x8001_1000;
+#[cfg(feature = "reloc")]
+const SCRATCH_ADDR: u32 = 0x0801_1000;
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
@@ -50,7 +61,19 @@ fn main() {
     let app_abs = std::fs::canonicalize(app_path).unwrap_or_else(|_| PathBuf::from(app_path));
 
     let mut mem = Memory::new();
+
+    #[cfg(not(feature = "reloc"))]
     let ccdl = load_ccdl(&data, &mut mem);
+
+    #[cfg(feature = "reloc")]
+    let ccdl = {
+        let reloc_path = "nand/qiye.reloc.bin";
+        let reloc_data = std::fs::read(reloc_path).unwrap_or_else(|e| {
+            eprintln!("Failed to read {reloc_path}: {e}");
+            std::process::exit(1);
+        });
+        load_ccdl_relocated(&data, &reloc_data, &mut mem)
+    };
 
     eprintln!("Loaded: {} imports, {} exports", ccdl.imports.len(), ccdl.exports.len());
     eprintln!("  load_addr:  0x{:08x}", ccdl.load_address);
@@ -226,6 +249,7 @@ mod integration {
         std::fs::read(&path).expect("qiye.app not found — place it in project root")
     }
 
+    #[cfg(not(feature = "reloc"))]
     fn setup_qiye() -> (Cpu, Memory, u32, u32) {
         let data = load_qiye();
         let mut mem = Memory::new();
@@ -233,7 +257,6 @@ mod integration {
         let entry = ccdl.entry_point;
         let code_start = ccdl.load_address;
         let code_end = ccdl.load_address + ccdl.data_size;
-        // Note: we skip HleState::new here to avoid patching, keeping tests simple
         let mut cpu = Cpu::new();
         cpu.pc = entry;
         cpu.next_pc = entry.wrapping_add(4);
@@ -249,6 +272,7 @@ mod integration {
     fn test_entry_points() {
         let data = load_qiye();
         let ccdl = parse_ccdl(&data);
+        // parse_ccdl always returns original addresses from the CCDL header
         assert_eq!(ccdl.entry_point, 0x80A0_00A0);
         assert_eq!(ccdl.load_address, 0x80A0_0000);
         let appmain = ccdl.exports.iter().find(|e| e.name == "AppMain");
@@ -256,6 +280,7 @@ mod integration {
         assert_eq!(appmain.unwrap().vaddr, 0x80A0_01A4);
     }
 
+    #[cfg(not(feature = "reloc"))]
     #[test]
     fn test_code_loaded_at_load_address() {
         let data = load_qiye();
@@ -267,6 +292,21 @@ mod integration {
         assert_eq!(appmain_insn, 0x27BD_FFE8);
     }
 
+    #[cfg(feature = "reloc")]
+    #[test]
+    fn test_code_loaded_relocated() {
+        let data = load_qiye();
+        let reloc_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("nand/qiye.reloc.bin");
+        let reloc_data = std::fs::read(&reloc_path).expect("nand/qiye.reloc.bin not found");
+        let mut mem = Memory::new();
+        let ccdl = load_ccdl_relocated(&data, &reloc_data, &mut mem);
+        assert_eq!(ccdl.load_address, 0x08A0_0000);
+        assert_eq!(ccdl.entry_point, 0x08A0_00A0);
+        let first_insn = mem.read_u32(ccdl.load_address);
+        assert_ne!(first_insn, 0);
+    }
+
+    #[cfg(not(feature = "reloc"))]
     #[test]
     fn test_bss_zeroed_after_load() {
         let data = load_qiye();
@@ -282,11 +322,11 @@ mod integration {
     #[test]
     fn test_write_wstring() {
         let mut mem = Memory::new();
-        write_wstring(&mut mem, 0x8001_1000, "test");
-        assert_eq!(mem.read_u16(0x8001_1000), b't' as u16);
-        assert_eq!(mem.read_u16(0x8001_1002), b'e' as u16);
-        assert_eq!(mem.read_u16(0x8001_1004), b's' as u16);
-        assert_eq!(mem.read_u16(0x8001_1006), b't' as u16);
-        assert_eq!(mem.read_u16(0x8001_1008), 0);
+        write_wstring(&mut mem, SCRATCH_ADDR, "test");
+        assert_eq!(mem.read_u16(SCRATCH_ADDR), b't' as u16);
+        assert_eq!(mem.read_u16(SCRATCH_ADDR + 2), b'e' as u16);
+        assert_eq!(mem.read_u16(SCRATCH_ADDR + 4), b's' as u16);
+        assert_eq!(mem.read_u16(SCRATCH_ADDR + 6), b't' as u16);
+        assert_eq!(mem.read_u16(SCRATCH_ADDR + 8), 0);
     }
 }
