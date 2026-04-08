@@ -283,7 +283,7 @@ impl HleState {
         self.current_task = 0;
         self.tasks.push(Task {
             status: TaskStatus::Running,
-            priority: 0,
+            priority: 63, // lower than audio task (prio 16) so audio gets scheduled first
             state: SavedCpuState {
                 gpr: cpu.gpr,
                 pc: cpu.pc,
@@ -362,35 +362,40 @@ impl HleState {
             self.current_task = next;
             self.load_cpu(cpu);
         } else {
-            // No ready tasks — check if everyone is waiting on semaphores
-            let all_dead_or_wait = self.tasks.iter().all(|t|
-                matches!(t.status, TaskStatus::Dead | TaskStatus::WaitSem(_) | TaskStatus::Sleeping(_))
-            );
-            if all_dead_or_wait {
-                // If tasks are sleeping, sleep the shortest time and retry
-                let mut min_wake: Option<u32> = None;
-                for t in &self.tasks {
-                    if let TaskStatus::Sleeping(wake_at) = t.status {
-                        min_wake = Some(min_wake.map_or(wake_at, |m: u32| m.min(wake_at)));
-                    }
+            // No ready tasks — sleep until the earliest wake time
+            let mut min_wake: Option<u32> = None;
+            for t in &self.tasks {
+                if let TaskStatus::Sleeping(wake_at) = t.status {
+                    min_wake = Some(min_wake.map_or(wake_at, |m: u32| m.min(wake_at)));
                 }
-                if let Some(wake_at) = min_wake {
-                    let now = self.current_tick();
-                    if wake_at > now {
-                        let ms = ((wake_at - now) * 10) as u64;
-                        std::thread::sleep(std::time::Duration::from_millis(ms));
-                    }
-                    // Retry after sleeping
-                    self.schedule(cpu);
-                    return;
+            }
+            if let Some(wake_at) = min_wake {
+                let now = self.current_tick();
+                if wake_at > now {
+                    let ms = ((wake_at - now) * 10) as u64;
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                } else {
+                    // Wake time already passed but tick granularity too coarse — sleep 5ms
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                eprintln!("[TASK] WARNING: all tasks blocked or dead — possible deadlock");
-                // Fall back to task 0 if it exists and isn't dead
-                if self.tasks[0].status != TaskStatus::Dead {
-                    self.tasks[0].status = TaskStatus::Running;
-                    self.current_task = 0;
-                    self.load_cpu(cpu);
-                }
+                // Retry after sleeping
+                self.schedule(cpu);
+                return;
+            }
+            // All tasks dead or waiting on semaphores
+            let has_waiting = self.tasks.iter().any(|t| matches!(t.status, TaskStatus::WaitSem(_)));
+            if has_waiting {
+                // Sem waiters exist — sleep briefly and retry (sem may be posted by interrupt/timer)
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                self.schedule(cpu);
+                return;
+            }
+            eprintln!("[TASK] WARNING: all tasks blocked or dead — possible deadlock");
+            // Fall back to task 0 if it exists and isn't dead
+            if self.tasks[0].status != TaskStatus::Dead {
+                self.tasks[0].status = TaskStatus::Running;
+                self.current_task = 0;
+                self.load_cpu(cpu);
             }
         }
     }
@@ -942,8 +947,8 @@ fn hle_exit(ctx: &mut EmuCtx) {
 
 /// Number of samples per waveout_write call (0x320 bytes / 2 = 400 i16 samples)
 const WAVEOUT_SAMPLES: usize = 400;
-/// Max queued bytes before waveout_can_write returns 0 (~100ms at 16kHz mono)
-const WAVEOUT_MAX_QUEUE: u32 = 16000 * 2; // 32000 bytes (~1s at 16kHz mono i16)
+/// Max queued bytes before waveout_write blocks (~50ms at 16kHz mono i16)
+const WAVEOUT_MAX_QUEUE: u32 = 800 * 2; // 1600 bytes (50ms)
 
 fn hle_waveout_open(ctx: &mut EmuCtx) {
     // waveout_open(params_ptr) — params: { u32 sample_rate, u16 bits_per_sample }
@@ -975,9 +980,24 @@ fn hle_waveout_open(ctx: &mut EmuCtx) {
 
 fn hle_waveout_write(ctx: &mut EmuCtx) {
     // waveout_write(handle, buf_ptr) — buf is 400 i16 samples (800 bytes)
+    // On real hardware this blocks when DMA buffer is full — emulate by sleeping
+    // the audio task when SDL2 queue exceeds threshold.
     let buf_ptr = ctx.cpu.gpr(5);
 
     if let Some(ref queue) = ctx.sdl.audio_queue {
+        if queue.size() > WAVEOUT_MAX_QUEUE && ctx.hle.tasks.len() > 1 {
+            // Too much buffered — put this task to sleep for ~5ms (1 tick)
+            let wake_at = ctx.hle.current_tick().wrapping_add(1);
+            let tid = ctx.hle.current_task;
+            ctx.hle.tasks[tid].status = TaskStatus::Sleeping(wake_at);
+            // Don't advance PC — re-execute waveout_write when we wake up
+            let ra = ctx.cpu.gpr(31);
+            ctx.cpu.pc = ra;
+            ctx.cpu.next_pc = ra.wrapping_add(4);
+            ctx.hle.schedule(ctx.cpu);
+            return;
+        }
+
         let mut samples = [0i16; WAVEOUT_SAMPLES];
         for i in 0..WAVEOUT_SAMPLES {
             samples[i] = ctx.mem.read_u16(buf_ptr + (i as u32) * 2) as i16;

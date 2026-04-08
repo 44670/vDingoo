@@ -158,6 +158,12 @@ impl EntityManager {
         &mut self.entities
     }
 
+    pub fn set_active(&mut self, idx: usize, active: bool) {
+        if let Some(ent) = self.entities.get_mut(idx) {
+            ent.active = active;
+        }
+    }
+
     #[allow(dead_code)]
     pub fn spawn(&mut self, type_id: EntityTypeId, pos: Vec3, model_name: Option<String>) -> u32 {
         let id = self.next_id;

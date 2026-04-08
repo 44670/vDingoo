@@ -1,6 +1,6 @@
 use crate::audio::AudioSystem;
 use crate::bsp;
-use crate::camera::{Camera, CameraMode};
+use crate::camera::Camera;
 use crate::enemy::{EnemyManager, EnemyType};
 use crate::game_data::GameData;
 use crate::entity::{EntityManager, EntityTypeId};
@@ -43,6 +43,8 @@ pub struct Game {
 }
 
 impl Game {
+    /// Start a new game on the given day.
+    /// Original flow: GameEngine_startNewGame → prepareEpisode(1,1) → Scene_loadDay(1)
     pub fn new(fs: AppFs, bsp: bsp::Bsp, bsp_path: &str, audio: AudioSystem) -> Self {
         // Build sorted list of all BSP files
         let mut bsp_files: Vec<String> = fs
@@ -59,7 +61,7 @@ impl Game {
         let debug_renderer = render::DebugRenderer::new();
         let mut model_renderer = ModelRenderer::new();
 
-        let (bsp_renderer, entities, mut camera, scripts) =
+        let (bsp_renderer, entities, camera, scripts) =
             Self::load_map_data(&fs, &bsp, bsp_path, &mut model_renderer);
 
         Self::load_entity_models(&mut model_renderer, &entities, &fs);
@@ -67,22 +69,44 @@ impl Game {
         let mut triggers = TriggerSystem::new();
         triggers.load_from_entities(&entities);
 
-        // Find player spawn point
-        let player = Self::create_player(&entities);
+        // --- Scene_resetPlayerState equivalent ---
+        // Player always starts at origin, positioned by script or scene transition
+        let model_key = "r_ken_a.soj";
+        Self::load_model_with_anim(&mut model_renderer, model_key, "r_ken_stand_a.sai", &fs);
 
-        // Spawn enemies from BSP entities
+        // Determine player start position from first camera spot
+        // Original: Scene_resetState calculates position from player facing direction
+        let player_pos = if let Some(spot) = bsp.camera_spots.first() {
+            Vec3::from(spot.pos)
+        } else {
+            // Fallback: center of BSP bounds
+            Vec3::new(
+                (bsp.bbox_min[0] + bsp.bbox_max[0]) * 0.5,
+                bsp.bbox_min[1] + 1.0,
+                (bsp.bbox_min[2] + bsp.bbox_max[2]) * 0.5,
+            )
+        };
+
+        let mut player = Player::new(player_pos);
+        player.model_name = Some(model_key.to_string());
+        println!("Player: spawned at ({:.1}, {:.1}, {:.1})", player.pos.x, player.pos.y, player.pos.z);
+
+        // --- Scene_loadEnemyModels equivalent (day 1) ---
+        // Day 1 loads: r_bully_a, r_nvyong_a, r_weed_a
+        Self::load_day_enemy_models(&mut model_renderer, 1, &fs);
+
         let enemies = Self::create_enemies(&entities);
 
         let ui_renderer = UiRenderer::new();
         let dialog = DialogBox::new();
 
-        // Default to 3rd person if we have a player
-        if let Some(ref p) = player {
-            camera.set_follow_mode(
-                p.pos + Vec3::new(0.0, 2.0, 0.0),
-                Vec3::new(0.0, 5.0, -10.0),
-            );
-        }
+        // Camera follows player from the start
+        // Original: Camera_initFollowMode in prepareEpisode
+        let mut camera = camera;
+        camera.set_follow_mode(
+            player_pos + Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(0.0, 5.0, -10.0),
+        );
 
         Game {
             fs,
@@ -98,15 +122,81 @@ impl Game {
             enemies,
             game_data: GameData::new(),
             camera,
-            player,
+            player: Some(player),
             player_mode: true,
             timer: FrameTimer::new(),
             input: InputState::new(),
             scripts,
             first_mouse: true,
-            show_entities: true,
+            show_entities: false,
             bsp_files,
             current_map_idx,
+        }
+    }
+
+    /// Load a SOJ model and its SAI animation into the renderer.
+    fn load_model_with_anim(renderer: &mut ModelRenderer, model: &str, anim: &str, fs: &AppFs) {
+        let soj_path = format!(".\\common\\{model}");
+        if let Some(data) = fs.read(&soj_path) {
+            if let Some(soj) = SojModel::parse(data) {
+                if renderer.upload_model(model, &soj, fs) {
+                    println!("Model: loaded {model}");
+                }
+            }
+        }
+        let sai_path = format!(".\\common\\{anim}");
+        if let Some(data) = fs.read(&sai_path) {
+            if let Some(anim_data) = crate::animation::SaiAnimation::parse(data) {
+                let ctrl = crate::animation::AnimController::new(&anim_data);
+                renderer.set_animation(model, anim_data, ctrl);
+            }
+        }
+    }
+
+    /// Preload enemy models for a specific day.
+    /// Original: Scene_loadEnemyModels with day-based switch.
+    fn load_day_enemy_models(renderer: &mut ModelRenderer, day: i32, fs: &AppFs) {
+        let models: &[(&str, &str)] = match day {
+            1 => &[
+                ("r_bully_a.soj", "r_bully_a.sai"),
+                ("r_nvyong_a.soj", "r_nvyong_a.sai"),
+                ("r_weed_a.soj", "r_weed_a.sai"),
+            ],
+            2 => &[
+                ("r_nvyong_a.soj", "r_nvyong_a.sai"),
+                ("r_lamper_a.soj", "r_lamper_a.sai"),
+                ("r_weed_a.soj", "r_weed_a.sai"),
+            ],
+            3 => &[
+                ("r_nvyong_a.soj", "r_nvyong_a.sai"),
+                ("r_weed_a.soj", "r_weed_a.sai"),
+                ("r_pangnvyong_a.soj", "r_pangnvyong_a.sai"),
+                ("r_nvyong_b.soj", "r_nvyong_b.sai"),
+            ],
+            4 => &[
+                ("r_victor_a.soj", "r_victor_a.sai"),
+                ("r_sam_b.soj", "r_sam_b.sai"),
+                ("r_bingnvyong_a.soj", "r_bingnvyong_a.sai"),
+                ("r_bug_a.soj", "r_bug_a.sai"),
+                ("r_qiutu_a.soj", "r_qiutu_a.sai"),
+            ],
+            5 => &[
+                ("r_bully_a.soj", "r_bully_a.sai"),
+                ("r_kate_a.soj", "r_kate_a.sai"),
+            ],
+            _ => &[
+                ("r_nvyong_a.soj", "r_nvyong_a.sai"),
+            ],
+        };
+        let mut loaded = 0;
+        for (model, anim) in models {
+            if !renderer.has_model(model) {
+                Self::load_model_with_anim(renderer, model, anim, fs);
+                loaded += 1;
+            }
+        }
+        if loaded > 0 {
+            println!("Day {day}: preloaded {loaded} enemy models");
         }
     }
 
@@ -226,7 +316,7 @@ impl Game {
         };
         let bsp = bsp::Bsp::parse(bsp_data);
 
-        let (bsp_renderer, entities, camera, scripts) =
+        let (bsp_renderer, entities, mut camera, scripts) =
             Self::load_map_data(&self.fs, &bsp, &bsp_path, &mut self.model_renderer);
 
         Self::load_entity_models(&mut self.model_renderer, &entities, &self.fs);
@@ -237,8 +327,28 @@ impl Game {
         self.entities = entities;
         self.triggers = TriggerSystem::new();
         self.triggers.load_from_entities(&self.entities);
-        self.player = Self::create_player(&self.entities);
         self.enemies = Self::create_enemies(&self.entities);
+
+        // Reposition player at first camera spot (no Player entities in BSP)
+        if let Some(ref mut player) = self.player {
+            let new_pos = if let Some(spot) = self.bsp.camera_spots.first() {
+                Vec3::from(spot.pos)
+            } else {
+                Vec3::new(
+                    (self.bsp.bbox_min[0] + self.bsp.bbox_max[0]) * 0.5,
+                    self.bsp.bbox_min[1] + 1.0,
+                    (self.bsp.bbox_min[2] + self.bsp.bbox_max[2]) * 0.5,
+                )
+            };
+            player.pos = new_pos;
+            player.velocity = Vec3::ZERO;
+            println!("Player: repositioned to ({:.1}, {:.1}, {:.1})", new_pos.x, new_pos.y, new_pos.z);
+            camera.set_follow_mode(
+                new_pos + Vec3::new(0.0, 2.0, 0.0),
+                Vec3::new(0.0, 5.0, -10.0),
+            );
+        }
+
         self.camera = camera;
         self.scripts = scripts;
         self.first_mouse = true;
@@ -399,26 +509,14 @@ impl Game {
                 if self.dialog.visible {
                     if self.dialog.is_complete() {
                         self.dialog.dismiss();
+                        // Resume scripts that were waiting on dialog
+                        for script in &mut self.scripts {
+                            if script.state == ScriptState::WaitFrames(u32::MAX) {
+                                script.state = ScriptState::Running;
+                            }
+                        }
                     } else {
                         self.dialog.skip_to_end();
-                    }
-                } else {
-                    // Script stepping: Enter = step one command
-                    let mut stepped_cmd = None;
-                    for (i, script) in self.scripts.iter_mut().enumerate() {
-                        if script.state == ScriptState::Running {
-                            if let Some(cmd) = script.step() {
-                                let name = script::command_name(cmd.id);
-                                let args_str: Vec<String> =
-                                    cmd.args.iter().map(|a| a.to_string()).collect();
-                                println!("SST[{i}] [{:3}] {name}({})", cmd.id, args_str.join(", "));
-                                stepped_cmd = Some((cmd.id, cmd.args.clone()));
-                            }
-                            break;
-                        }
-                    }
-                    if let Some((id, args)) = stepped_cmd {
-                        self.handle_command(id, &args);
                     }
                 }
             }
@@ -443,24 +541,46 @@ impl Game {
                 println!("Entity debug: {}", if self.show_entities { "ON" } else { "OFF" });
             }
 
-            // Auto-run scripts (one command per frame, pause during dialog)
+            // Auto-run scripts — execute commands until we hit a blocking one
             if !self.dialog.visible {
-                let mut auto_cmd = None;
-                for (i, script) in self.scripts.iter_mut().enumerate() {
-                    if script.state == ScriptState::Running {
-                        if let Some(cmd) = script.step() {
-                            let name = script::command_name(cmd.id);
-                            let args_str: Vec<String> =
-                                cmd.args.iter().map(|a| a.to_string()).collect();
-                            println!("AUTO[{i}] [{:3}] {name}({})", cmd.id, args_str.join(", "));
-                            auto_cmd = Some((cmd.id, cmd.args.clone()));
+                let mut cmds_this_frame = 0;
+                'script_loop: loop {
+                    if cmds_this_frame >= 100 { break; } // safety limit
+                    let mut got_cmd = None;
+                    for (i, script) in self.scripts.iter_mut().enumerate() {
+                        if script.state == ScriptState::Running {
+                            if let Some(cmd) = script.step() {
+                                let name = script::command_name(cmd.id);
+                                let args_str: Vec<String> =
+                                    cmd.args.iter().map(|a| a.to_string()).collect();
+                                println!("AUTO[{i}] [{:3}] {name}({})", cmd.id, args_str.join(", "));
+                                got_cmd = Some((i, cmd.id, cmd.args.clone()));
+                            }
+                            break;
                         }
-                        break;
+                    }
+                    match got_cmd {
+                        Some((script_idx, id, args)) => {
+                            let blocking = self.handle_command(id, &args);
+                            cmds_this_frame += 1;
+                            if blocking {
+                                // Command blocks — stop running more this frame
+                                // (e.g., ShowDialog waits for dismiss, WaitFrames pauses)
+                                if let Some(script) = self.scripts.get_mut(script_idx) {
+                                    if id == 30 || id == 33 || id == 34 {
+                                        // Dialog commands — script waits until dialog dismissed
+                                        script.state = ScriptState::WaitFrames(u32::MAX);
+                                    }
+                                }
+                                break 'script_loop;
+                            }
+                        }
+                        None => break 'script_loop,
                     }
                 }
-                if let Some((id, args)) = auto_cmd {
-                    self.handle_command(id, &args);
-                }
+            } else {
+                // Check if dialog was just dismissed — resume script
+                // (handled below in dialog update)
             }
 
             // Update script wait states
@@ -584,9 +704,107 @@ impl Game {
         }
     }
 
-    /// Handle a script command — dispatch to audio, dialog, etc.
-    fn handle_command(&mut self, cmd_id: u16, args: &[script::ArgValue]) {
+    /// Extract a numeric value from an ArgValue (int or fixed-point).
+    fn arg_f32(arg: &script::ArgValue) -> Option<f32> {
+        match arg {
+            script::ArgValue::Fixed(v) => Some(*v),
+            script::ArgValue::Int(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    fn arg_i32(arg: &script::ArgValue) -> Option<i32> {
+        match arg {
+            script::ArgValue::Int(v) => Some(*v),
+            script::ArgValue::Fixed(v) => Some(*v as i32),
+            _ => None,
+        }
+    }
+
+    /// Handle a script command. Returns true if the command blocks execution.
+    fn handle_command(&mut self, cmd_id: u16, args: &[script::ArgValue]) -> bool {
         match cmd_id {
+            // === Input queries (0-6) — no-op in remaster, tree handles result ===
+            0..=6 => {}
+
+            // LogMessage(text)
+            7 => {
+                if let Some(script::ArgValue::Str(text)) = args.first() {
+                    println!("Script: ***{text}");
+                }
+            }
+
+            // SetFogColorTop(r, g, b, frames) / SetFogColorBottom(r, g, b, frames)
+            8 | 9 => {
+                // Fog color animation — skip for now
+            }
+
+            // LoadNextDay
+            10 => {
+                let next_day = self.game_data.day + 1;
+                println!("Script: LoadNextDay → day {next_day}");
+                self.game_data.day = next_day;
+                // Find first map of next day
+                let day_str = format!("day{next_day}");
+                if let Some(idx) = self.bsp_files.iter().position(|p| p.contains(&day_str)) {
+                    self.switch_map(idx);
+                    return true;
+                }
+            }
+
+            // SetupCamera
+            11 => {
+                if let Some(ref player) = self.player {
+                    self.camera.set_follow_mode(
+                        player.pos + Vec3::new(0.0, 2.0, 0.0),
+                        Vec3::new(0.0, 5.0, -10.0),
+                    );
+                }
+            }
+
+            // AttachCameraToPlayer
+            25 => {
+                if let Some(ref player) = self.player {
+                    self.camera.set_follow_mode(
+                        player.pos + Vec3::new(0.0, 2.0, 0.0),
+                        Vec3::new(0.0, 5.0, -10.0),
+                    );
+                }
+            }
+
+            // ShowDialog(text)
+            30 => {
+                if let Some(script::ArgValue::Str(text)) = args.first() {
+                    self.dialog.show(text);
+                    println!("Dialog: \"{text}\"");
+                    return true; // block until dismissed
+                }
+            }
+
+            // ShowAutoDialog(text) — auto-dismiss after display
+            33 => {
+                if let Some(script::ArgValue::Str(text)) = args.first() {
+                    self.dialog.show(text);
+                    println!("Dialog(auto): \"{text}\"");
+                    return true;
+                }
+            }
+
+            // ShowDialogWithChoice(text, ...) — show dialog, block
+            34 => {
+                if let Some(script::ArgValue::Str(text)) = args.first() {
+                    self.dialog.show(text);
+                    println!("Dialog(choice): \"{text}\"");
+                    return true;
+                }
+            }
+
+            // IsDialogActive / CheckDialogDone — query, no-op
+            36 | 37 => {}
+
+            // ShowLoadingScreen(mode) — no-op
+            38 => {}
+
             // PlayBgm(sound_id, loop_flag)
             41 => {
                 if let Some(script::ArgValue::Int(id)) = args.first() {
@@ -603,7 +821,6 @@ impl Game {
             // StopBgm
             42 => {
                 self.audio.stop_all();
-                println!("Audio: StopBgm");
             }
             // PlaySfx(sound_id)
             45 => {
@@ -611,91 +828,191 @@ impl Game {
                     let name = format!("{id}.sau");
                     if self.audio.load_clip(&name, &self.fs) {
                         self.audio.play(&name, false, 1.0);
-                        println!("Audio: PlaySfx {name}");
                     }
                 }
             }
-            // StopAllSounds
-            46 => {
+            // StopAllSounds / FreeAllSounds
+            46 | 48 => {
                 self.audio.stop_all();
-                println!("Audio: StopAllSounds");
             }
-            // PlaySfx3D(sound_id, x, y, z) — play as 2D for now
+            // PlaySfx3D(sound_id, x, y, z)
             47 => {
                 if let Some(script::ArgValue::Int(id)) = args.first() {
                     let name = format!("{id}.sau");
                     if self.audio.load_clip(&name, &self.fs) {
                         self.audio.play(&name, false, 0.6);
-                        println!("Audio: PlaySfx3D {name}");
                     }
                 }
             }
-            // FreeAllSounds
-            48 => {
-                self.audio.stop_all();
-                println!("Audio: FreeAllSounds");
-            }
-            // SetPlayerPosition(x, y, z)
-            78 => {
-                if args.len() >= 3 {
-                    let x = match &args[0] { script::ArgValue::Fixed(v) => *v, script::ArgValue::Int(v) => *v as f32, _ => return };
-                    let y = match &args[1] { script::ArgValue::Fixed(v) => *v, script::ArgValue::Int(v) => *v as f32, _ => return };
-                    let z = match &args[2] { script::ArgValue::Fixed(v) => *v, script::ArgValue::Int(v) => *v as f32, _ => return };
-                    if let Some(ref mut player) = self.player {
-                        player.pos = Vec3::new(x, y, z);
-                        println!("Player: SetPosition({x:.1}, {y:.1}, {z:.1})");
-                    }
-                }
-            }
-            // ShowDialog(text)
-            30 => {
-                if let Some(script::ArgValue::Str(text)) = args.first() {
-                    self.dialog.show(text);
-                    println!("Dialog: \"{text}\"");
-                }
-            }
+
+            // SetSceneFlag(idx)
+            49 => {}
+
             // SetGameDataFlag(idx)
             50 => {
                 if let Some(script::ArgValue::Int(idx)) = args.first() {
                     self.game_data.set_flag(*idx);
-                    println!("GameData: SetFlag({idx})");
                 }
             }
-            // GetGameDataFlag(idx) — stores result for script comparison
+            // GetGameDataFlag(idx)
             51 => {
                 if let Some(script::ArgValue::Int(idx)) = args.first() {
-                    let val = self.game_data.get_flag(*idx);
-                    println!("GameData: GetFlag({idx}) = {val}");
+                    let _val = self.game_data.get_flag(*idx);
                 }
             }
             // ClearGameDataFlag(idx)
             52 => {
                 if let Some(script::ArgValue::Int(idx)) = args.first() {
                     self.game_data.clear_flag(*idx);
-                    println!("GameData: ClearFlag({idx})");
                 }
             }
-            // GetDay
-            96 => {
-                println!("GameData: GetDay() = {}", self.game_data.day);
-            }
-            // CollectItem(idx)
-            212 => {
-                if let Some(script::ArgValue::Int(idx)) = args.first() {
-                    if self.game_data.collect_item(*idx) {
-                        println!("GameData: CollectItem({idx}) — new!");
+
+            // SetMenuField / SetMenuMode / SetMenuLayout — no-op
+            61..=63 => {}
+
+            // GetPlayerPos/Rot — query, no-op (tree handles result)
+            64..=67 => {}
+
+            // CountActiveEntities / CountCollectedItems — query
+            68 | 69 => {}
+
+            // PausePlayer(flag)
+            73 => {}
+
+            // SetPlayerPosition(x, y, z)
+            78 => {
+                if args.len() >= 3 {
+                    if let (Some(x), Some(y), Some(z)) = (
+                        Self::arg_f32(&args[0]),
+                        Self::arg_f32(&args[1]),
+                        Self::arg_f32(&args[2]),
+                    ) {
+                        if let Some(ref mut player) = self.player {
+                            player.pos = Vec3::new(x, y, z);
+                            println!("Player: SetPosition({x:.1}, {y:.1}, {z:.1})");
+                        }
                     }
                 }
             }
-            // CheckItemCollected(idx)
-            213 => {
-                if let Some(script::ArgValue::Int(idx)) = args.first() {
-                    let has = self.game_data.has_item(*idx);
-                    println!("GameData: CheckItem({idx}) = {has}");
+
+            // CheckAllEnemiesDead — query
+            93 => {}
+
+            // GetDay — query
+            96 => {}
+
+            // ResetSceneState / IsSceneReady / SetSceneVar — no-op for now
+            99..=101 => {}
+
+            // SetPlayerModel(name)
+            103 => {
+                if let Some(script::ArgValue::Str(name)) = args.first() {
+                    // Load model if not loaded
+                    let path = format!(".\\common\\{name}");
+                    if !self.model_renderer.has_model(name) {
+                        if let Some(data) = self.fs.read(&path) {
+                            if let Some(soj) = SojModel::parse(data) {
+                                self.model_renderer.upload_model(name, &soj, &self.fs);
+                            }
+                        }
+                        self.model_renderer.load_animation(name, &self.fs);
+                    }
+                    if let Some(ref mut player) = self.player {
+                        player.model_name = Some(name.clone());
+                        println!("Player: SetModel({name})");
+                    }
                 }
             }
+
+            // IsPlayerAlive — query
+            104 => {}
+
+            // ResetScene
+            105 => {}
+
+            // SetEntityVisible(entity_idx, visible)
+            111 => {
+                if args.len() >= 2 {
+                    if let (Some(idx), Some(vis)) = (Self::arg_i32(&args[0]), Self::arg_i32(&args[1])) {
+                        self.entities.set_active(idx as usize, vis != 0);
+                    }
+                }
+            }
+
+            // SetEntityState / SetEntityAnimation / SetEntityAnimLoop — stub
+            117 | 127 | 128 => {}
+
+            // SetTalkTriggerActive(trigger_idx, active)
+            115 => {}
+
+            // EnableTrigger(idx, enabled)
+            135 => {}
+
+            // RemoveEntity(idx)
+            136 => {
+                if let Some(idx) = args.first().and_then(Self::arg_i32) {
+                    self.entities.set_active(idx as usize, false);
+                }
+            }
+
+            // SpawnEnemy(type_id, x, y, z, ...) — stub
+            137 => {}
+
+            // RemoveAllEnemies
+            156 => {
+                self.enemies.remove_all();
+            }
+
+            // SetStayBoxBounds / AddStayBoxExit / AddStayBoxEntry — collision areas, stub
+            159 | 161..=165 => {}
+
+            // StayBox setup
+            160 => {}
+
+            // FadeScreen(mode)
+            216 => {
+                // Fade effect — skip for now
+            }
+
+            // CollectItem(idx)
+            212 => {
+                if let Some(script::ArgValue::Int(idx)) = args.first() {
+                    self.game_data.collect_item(*idx);
+                }
+            }
+            // CheckItemCollected(idx)
+            213 => {}
+
+            // SpawnEntityWithParams (221) — complex entity spawn
+            221 => {
+                // Extract entity model name and position from args
+                if args.len() >= 7 {
+                    if let Some(script::ArgValue::Str(model)) = args.get(3) {
+                        let x = args.get(4).and_then(Self::arg_f32).unwrap_or(0.0);
+                        let y = args.get(5).and_then(Self::arg_f32).unwrap_or(0.0);
+                        let z = args.get(6).and_then(Self::arg_f32).unwrap_or(0.0);
+                        println!("Script: SpawnEntity \"{model}\" at ({x:.1}, {y:.1}, {z:.1})");
+                        // Load model if needed
+                        let path = format!(".\\common\\{model}");
+                        if !self.model_renderer.has_model(model) {
+                            if let Some(data) = self.fs.read(&path) {
+                                if let Some(soj) = SojModel::parse(data) {
+                                    self.model_renderer.upload_model(model, &soj, &self.fs);
+                                }
+                            }
+                            self.model_renderer.load_animation(model, &self.fs);
+                        }
+                    }
+                }
+            }
+
+            // SetEntityFullParams (121) — complex entity setup
+            121 => {}
+
+            // All other commands — log but don't block
             _ => {}
         }
+        false // non-blocking by default
     }
 
     fn create_enemies(entities: &EntityManager) -> EnemyManager {
@@ -710,22 +1027,6 @@ impl Game {
             println!("Enemies: spawned {}", manager.enemies.len());
         }
         manager
-    }
-
-    fn create_player(entities: &EntityManager) -> Option<Player> {
-        // Find first Player entity spawn point
-        for ent in entities.entities() {
-            if ent.type_id == EntityTypeId::Player {
-                let mut player = Player::new(ent.transform.position);
-                player.model_name = ent.model_name.clone();
-                println!(
-                    "Player spawned at ({:.1}, {:.1}, {:.1})",
-                    player.pos.x, player.pos.y, player.pos.z,
-                );
-                return Some(player);
-            }
-        }
-        None
     }
 
     fn load_scripts(fs: &AppFs, bsp_path: &str) -> Vec<ScriptEngine> {
@@ -747,8 +1048,15 @@ impl Game {
         let mut scripts = Vec::new();
         for path in &sst_files {
             if let Some(data) = fs.read(path) {
-                let engine = ScriptEngine::parse_sst(data);
-                println!("SST: {path} — {} commands", engine.command_count());
+                let mut engine = ScriptEngine::parse_sst(data);
+                // Only auto-run ep0.sst (scene setup script).
+                // Other scripts (epXXXX.sst) are triggered by gameplay events.
+                let is_ep0 = path.contains("ep0.sst");
+                if !is_ep0 {
+                    engine.state = ScriptState::Done;
+                }
+                let state_str = if is_ep0 { "AUTO" } else { "idle" };
+                println!("SST: {path} — {} commands [{state_str}]", engine.command_count());
                 scripts.push(engine);
             }
         }

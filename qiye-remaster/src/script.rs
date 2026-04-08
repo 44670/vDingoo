@@ -58,18 +58,19 @@ impl ScriptEngine {
         let mut off = 0;
 
         while off + 12 <= data.len() {
-            // Scan for delimiter: 24 00 00 00 00 00
+            // Scan for dispatch node marker: 24 00 00 00 00 00
+            // 0x24 = AnimNode type "dispatch to handler", followed by 00 00 (flags) 00 00 (padding)
             if data[off] != 0x24 || data[off + 1..off + 6] != [0, 0, 0, 0, 0] {
                 off += 2;
                 continue;
             }
 
             let cmd_id = read_u16_le(data, off + 6);
-            let _extra = read_u16_le(data, off + 8);
+            let extra = read_u16_le(data, off + 8);
             let arg_count = read_u16_le(data, off + 10);
 
-            // Sanity check
-            if cmd_id >= 300 || arg_count >= 20 {
+            // Sanity check — skip nodes with extra != 0 (sub-tree refs, not flat args)
+            if cmd_id >= 300 || arg_count >= 20 || extra != 0 {
                 off += 2;
                 continue;
             }
@@ -114,8 +115,9 @@ impl ScriptEngine {
                         aoff += 8;
                     }
                     _ => {
-                        // Unknown type — skip
-                        aoff += 4 + asize;
+                        // Unknown arg type — mark invalid and stop
+                        valid = false;
+                        break;
                     }
                 }
             }
@@ -146,15 +148,12 @@ impl ScriptEngine {
 
         let cmd = &self.commands[self.pc];
         self.pc += 1;
-
-        // Handle WaitFrames internally
-        if cmd.id == ANIM_WAIT_FRAMES {
-            if let Some(ArgValue::Int(n)) = cmd.args.first() {
-                self.state = ScriptState::WaitFrames(*n as u32);
-            }
-        }
-
         Some(cmd)
+    }
+
+    /// Set script to wait N frames before resuming.
+    pub fn wait_frames(&mut self, n: u32) {
+        self.state = ScriptState::WaitFrames(n);
     }
 
     pub fn update(&mut self) {
@@ -166,19 +165,6 @@ impl ScriptEngine {
                 self.state = ScriptState::Running;
             }
             _ => {}
-        }
-
-        if self.auto_run && self.state == ScriptState::Running {
-            // Execute commands until we hit a wait or done
-            while self.state == ScriptState::Running {
-                if let Some(cmd) = self.step() {
-                    let name = command_name(cmd.id);
-                    let args: Vec<String> = cmd.args.iter().map(|a| a.to_string()).collect();
-                    println!("  [{:3}] {name}({})", cmd.id, args.join(", "));
-                } else {
-                    break;
-                }
-            }
         }
     }
 
@@ -192,30 +178,25 @@ impl ScriptEngine {
     }
 }
 
-// AnimScript handler commands (IDs 0-24, before the main ScriptTable)
-const ANIM_WAIT_FRAMES: u16 = 3; // WaitFrames from AnimScriptHandler
-
 /// Get human-readable command name from SST command ID.
+///
+/// Command IDs map to ScriptTable entries: cmd_id = (table_slot - 0x1a) / 2
+/// IDs 0-10 are in the AnimScriptHandler's own table (not tree flow control).
+/// Tree control flow (SetVar/Compare/Jump) is in AnimNode structure, not command IDs.
 pub fn command_name(id: u16) -> &'static str {
     match id {
-        // AnimScript handler commands (0-24)
-        0 => "Anim_SetVar",
-        1 => "Anim_GetVar",
-        2 => "Anim_Compare",
-        3 => "Anim_WaitFrames",
-        4 => "Anim_Jump",
-        5 => "Anim_JumpIf",
-        6 => "Anim_Call",
-        7 => "Anim_Return",
-        8 => "Anim_Yield",
-        9 => "Anim_End",
-        10 => "Anim_Random",
-        // ScriptTable commands (starting at slot 0)
-        // Mapped from ScriptTable_init: cmd_id maps to (table_index - 0x1a) / 2
-        // But AnimScriptHandler uses slots 0-24 for its own commands
-        // The ScriptTable commands appear to use IDs starting at some offset
-        // From observation: cmd 11=SetupCamera, 78=SetPlayerPosition
-        // table: arg1[0x30]=SetupCamera → (0x30-0x1a)/2 = 11 ✓
+        // AnimScriptHandler built-in commands (0-10)
+        0 => "CheckButtonJustPressed0",
+        1 => "CheckButtonJustPressed1",
+        2 => "CheckDpadHeld",
+        3 => "CheckButtonHeld",
+        4 => "CheckButtonPressed",
+        5 => "GetAnalogX",
+        6 => "GetAnalogY",
+        7 => "LogMessage",
+        8 => "SetFogColorTop",
+        9 => "SetFogColorBottom",
+        10 => "LoadNextDay",
         11 => "SetupCamera",
         12 => "ResetCamera",
         13 => "RestoreCamera",

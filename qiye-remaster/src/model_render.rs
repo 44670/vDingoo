@@ -348,6 +348,12 @@ impl ModelRenderer {
         false
     }
 
+    /// Set animation data directly.
+    pub fn set_animation(&mut self, model_name: &str, anim: SaiAnimation, ctrl: AnimController) {
+        self.animations.insert(model_name.to_string(), anim);
+        self.anim_controllers.insert(model_name.to_string(), ctrl);
+    }
+
     /// Update all animation controllers.
     pub fn update_animations(&mut self, dt: f32) {
         for (name, ctrl) in &mut self.anim_controllers {

@@ -265,4 +265,10 @@ impl EnemyManager {
     pub fn active_count(&self) -> usize {
         self.enemies.iter().filter(|e| e.active).count()
     }
+
+    pub fn remove_all(&mut self) {
+        for e in &mut self.enemies {
+            e.active = false;
+        }
+    }
 }

@@ -186,6 +186,35 @@ fn main() {
             let (_sdl, window, _gl_context, mut event_pump) = init_sdl(&format!("七夜 — NPC: {model_name}"));
             viewer::run_npc(&fs, model_name, &window, &mut event_pump);
         }
+        "info" => {
+            // Dump BSP entity info for all day1 maps (no SDL needed)
+            let filter = args.get(3).map(|s| s.as_str()).unwrap_or("day1");
+            let mut bsp_files: Vec<String> = fs
+                .list_files()
+                .filter(|p| p.ends_with(".sbp") && p.contains(filter))
+                .map(|p| p.to_string())
+                .collect();
+            bsp_files.sort();
+            for path in &bsp_files {
+                if let Some(data) = fs.read(path) {
+                    let b = bsp::Bsp::parse(data);
+                    let mut type_counts: std::collections::HashMap<i16, usize> = std::collections::HashMap::new();
+                    for e in &b.entities {
+                        *type_counts.entry(e.entity_type).or_default() += 1;
+                    }
+                    let mut types: Vec<_> = type_counts.into_iter().collect();
+                    types.sort();
+                    let type_str: Vec<String> = types.iter().map(|(t,c)| format!("t{t}={c}")).collect();
+                    let models: Vec<&str> = b.entities.iter()
+                        .filter_map(|e| e.model_name.as_deref())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter().collect();
+                    println!("{path}: {} ents [{}] | {} spots | models: {:?}",
+                        b.entities.len(), type_str.join(", "),
+                        b.camera_spots.len(), models);
+                }
+            }
+        }
         _ => {
             eprintln!("Unknown mode: {mode}");
             print_usage();
