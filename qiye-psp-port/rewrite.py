@@ -7,18 +7,11 @@ SPECIAL2 (opcode 0x1C) patches:
   msub/msubu: in-place → SPECIAL func 0x2E/0x2F
   mul rd,rs,rt → trampoline with mult+mflo, appended after BSS
 
-Strategy for mul:
-  1. Consecutive muls (N≥2): J trampoline; NOP; NOP remaining.
-     Trampoline: mult;mflo × N; j run[-1]+4; nop
-  2. Single mul NOT in delay slot:
-     a. If mul+4 is NOT a branch/jump: leave it as J's delay slot.
-        It executes once with stale rd (harmless for ALU ops), then
-        trampoline returns to mul+4 which re-executes with correct rd.
-        Trampoline: mult; mflo; j mul+4; nop
-     b. If mul+4 IS a branch/jump: NOP it, handle in trampoline.
-  3. Mul in delay slot of a branch at mul-4:
-     Replace the branch with J trampoline; NOP.
-     Trampoline: mult; mflo; emulate branch (inverted+J for range).
+Strategy for mul (simplified):
+  Always: patch site = J trampoline; NOP
+  Trampoline: mult; mflo; <next_insn>; J back
+  If <next_insn> is also a mul, expand it inline (mult;mflo) and
+  fetch the instruction after that, recursively.
 """
 
 import struct, sys
@@ -53,7 +46,6 @@ def is_branch_or_jump(insn):
     return False
 
 def is_conditional_branch(insn):
-    """BEQ/BNE/BLEZ/BGTZ/REGIMM — has 16-bit PC-relative offset."""
     op = (insn >> 26) & 0x3F
     return op in (1, 4, 5, 6, 7)
 
@@ -64,21 +56,12 @@ def branch_target(insn, pc):
 
 def invert_branch(insn):
     op = (insn >> 26) & 0x3F
-    if op == 4: return (insn & ~(0x3F << 26)) | (5 << 26)   # BEQ → BNE
-    if op == 5: return (insn & ~(0x3F << 26)) | (4 << 26)   # BNE → BEQ
-    if op == 6: return (insn & ~(0x3F << 26)) | (7 << 26)   # BLEZ → BGTZ
-    if op == 7: return (insn & ~(0x3F << 26)) | (6 << 26)   # BGTZ → BLEZ
-    if op == 1: return insn ^ (1 << 16)                      # REGIMM: flip bit 16
+    if op == 4: return (insn & ~(0x3F << 26)) | (5 << 26)
+    if op == 5: return (insn & ~(0x3F << 26)) | (4 << 26)
+    if op == 6: return (insn & ~(0x3F << 26)) | (7 << 26)
+    if op == 7: return (insn & ~(0x3F << 26)) | (6 << 26)
+    if op == 1: return insn ^ (1 << 16)
     raise ValueError(f"cannot invert branch op={op}")
-
-def is_j_no_link(insn):
-    return ((insn >> 26) & 0x3F) == 2
-
-def is_link(insn):
-    op = (insn >> 26) & 0x3F
-    if op == 3: return True
-    if op == 0 and (insn & 0x3F) == 9: return True
-    return False
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -101,82 +84,29 @@ def main():
 
     code = bytearray(app[rawd_off : rawd_off + data_size])
 
-    # --- Pass 1: identify all mul positions ---
+    # --- Pass 1: identify all mul positions and branch targets ---
     mul_offsets = set()
+    branch_targets = set()
     for i in range(0, data_size, 4):
         insn = struct.unpack_from('<I', code, i)[0]
         if is_mul(insn):
             mul_offsets.add(i)
+        op = (insn >> 26) & 0x3F
+        if op in (1, 4, 5, 6, 7):
+            imm = insn & 0xFFFF
+            if imm & 0x8000: imm -= 0x10000
+            branch_targets.add(load_addr + i + 4 + (imm << 2))
 
     # --- Pass 2: patch ---
     tramp = bytearray()
     tramp_base = mem_size
-    new_relocs = []       # offsets needing J26 reloc (new J instructions)
-    killed_offsets = set() # code offsets we modified (NOP'd or replaced) — remove old relocs
-    n_madd = n_msub = n_mul_tramp = n_delay = 0
-    counts = {'simple': 0, 'branch': 0, 'link': 0, 'j': 0, 'jr': 0, 'consecutive': 0}
+    new_relocs = []       # offsets needing J26 reloc
+    killed_offsets = set() # code offsets we modified
+    n_madd = n_msub = n_mul = 0
     patched = set()
 
-    # Pre-scan: collect all branch targets so we know which addrs are jumped to
-    branch_targets = set()
-    for ii in range(0, data_size, 4):
-        w = struct.unpack_from('<I', code, ii)[0]
-        op = (w >> 26) & 0x3F
-        if op in (1, 4, 5, 6, 7):
-            imm = w & 0xFFFF
-            if imm & 0x8000: imm -= 0x10000
-            branch_targets.add(load_addr + ii + 4 + (imm << 2))
-
     REMAP = {0x00: 0x1C, 0x01: 0x1D, 0x04: 0x2E, 0x05: 0x2F}
-
-    def emit_tramp(*words):
-        """Append instructions to trampoline, return offset of first."""
-        off = tramp_base + len(tramp)
-        for w in words:
-            tramp.extend(struct.pack('<I', w & 0xFFFFFFFF))
-        return off
-
-    def emit_mul_expansion(mul_insn):
-        """Emit mult;mflo for a mul instruction."""
-        rs, rt, rd = mul_parts(mul_insn)
-        tramp.extend(pk(make_mult(rs, rt), make_mflo(rd)))
-
-    def emit_j_or_jal(insn):
-        """Copy a J/JAL instruction into trampoline and add its reloc."""
-        off = tramp_base + len(tramp)
-        tramp.extend(pk(insn))
-        new_relocs.append(off)
-
-    def kill(code_off):
-        """Mark a code offset as modified — its old reloc entry must be removed."""
-        killed_offsets.add(code_off)
-
-    def emit_branch_emulation(branch_insn, branch_va, ds_insn):
-        """Emit inverted-branch + J to handle a conditional branch.
-
-        Layout:
-          inv_branch skip    ; if NOT taken, skip to fall-through path
-          <ds>               ; branch's delay slot (always executes)
-          j taken_target     ; branch WAS taken
-          nop
-        skip:
-          j fall_through     ; branch NOT taken
-          nop
-        """
-        target = branch_target(branch_insn, branch_va)
-        fall = branch_va + 8  # past branch + delay slot
-
-        inv = invert_branch(branch_insn)
-        inv = (inv & 0xFFFF0000) | (2 & 0xFFFF)  # skip 2 insns (+2)
-
-        tramp.extend(pk(inv, ds_insn))
-        j_taken_off = tramp_base + len(tramp)
-        tramp.extend(pk(make_j(target), NOP))
-        new_relocs.append(j_taken_off)
-
-        j_fall_off = tramp_base + len(tramp)
-        tramp.extend(pk(make_j(fall), NOP))
-        new_relocs.append(j_fall_off)
+    n_delay = 0
 
     i = 0
     while i < data_size:
@@ -200,240 +130,146 @@ def main():
         if func != 0x02:
             i += 4; continue
 
+        if i in patched:
+            i += 4; continue
+
         # --- mul rd,rs,rt ---
 
-        # Case 3: mul in delay slot of branch at i-4
+        # Case: mul in delay slot of branch/jump at i-4
         if i >= 4:
             prev = struct.unpack_from('<I', code, i - 4)[0]
-            if is_branch_or_jump(prev):
+            if is_branch_or_jump(prev) and (i - 4) not in patched:
                 patched.add(i)
+                n_mul += 1
                 n_delay += 1
-
                 branch_off = i - 4
                 branch_va = load_addr + branch_off
-                mul_insn = insn
 
-                t_off = emit_tramp()  # record start
+                t_off = tramp_base + len(tramp)
                 t_addr = load_addr + t_off
-                rs, rt, rd = mul_parts(mul_insn)
+                rs, rt, rd = mul_parts(insn)
 
                 if is_conditional_branch(prev):
-                    # Conditional branch with mul in delay slot.
-                    # CRITICAL: the branch tests GPRs BEFORE the mul writes.
-                    # So we must emit mult (writes only HI/LO, not GPRs)
-                    # first, then test the branch condition with original GPRs,
-                    # and use mflo as the delay slot of the inverted branch
-                    # (always executes, just like the original delay slot).
-                    tramp.extend(pk(make_mult(rs, rt)))
-                    emit_branch_emulation(prev, branch_va, make_mflo(rd))
-                elif is_j_no_link(prev):
-                    # Unconditional J: mult+mflo then jump to target.
-                    emit_mul_expansion(mul_insn)
+                    # mult first (doesn't affect GPRs used by branch condition),
+                    # then inverted branch to skip taken path, mflo as delay slot
+                    target = branch_target(prev, branch_va)
+                    fall = branch_va + 8
+
+                    inv = invert_branch(prev)
+                    inv = (inv & 0xFFFF0000) | (2 & 0xFFFF)  # skip 2 insns
+
+                    tramp.extend(pk(make_mult(rs, rt), inv, make_mflo(rd)))
+                    j_taken = tramp_base + len(tramp)
+                    tramp.extend(pk(make_j(target), NOP))
+                    new_relocs.append(j_taken)
+                    j_fall = tramp_base + len(tramp)
+                    tramp.extend(pk(make_j(fall), NOP))
+                    new_relocs.append(j_fall)
+                elif ((prev >> 26) & 0x3F) == 2:  # J (no link)
                     j_target = (prev & 0x03FFFFFF) << 2 | (branch_va & 0xF0000000)
+                    tramp.extend(pk(make_mult(rs, rt), make_mflo(rd)))
                     j_off = tramp_base + len(tramp)
                     tramp.extend(pk(make_j(j_target), NOP))
                     new_relocs.append(j_off)
-                elif is_link(prev):
-                    # JAL/JALR: mult+mflo then set $ra and jump.
-                    emit_mul_expansion(mul_insn)
-                    if ((prev >> 26) & 0x3F) == 3:  # JAL
-                        j_target = (prev & 0x03FFFFFF) << 2 | (branch_va & 0xF0000000)
-                        ra_val = branch_va + 8
-                        tramp.extend(pk(
-                            0x3C1F0000 | (ra_val >> 16),
-                            0x37FF0000 | (ra_val & 0xFFFF),
-                        ))
-                        j_off = tramp_base + len(tramp)
-                        tramp.extend(pk(make_j(j_target), NOP))
-                        new_relocs.append(j_off)
-                    else:
-                        jalr_rs = (prev >> 21) & 0x1F
-                        ra_val = branch_va + 8
-                        tramp.extend(pk(
-                            0x3C1F0000 | (ra_val >> 16),
-                            0x37FF0000 | (ra_val & 0xFFFF),
-                            (jalr_rs << 21) | 8,  # jr $rs
-                            NOP,
-                        ))
+                elif ((prev >> 26) & 0x3F) == 3:  # JAL
+                    j_target = (prev & 0x03FFFFFF) << 2 | (branch_va & 0xF0000000)
+                    ra_val = branch_va + 8
+                    tramp.extend(pk(make_mult(rs, rt), make_mflo(rd),
+                                    0x3C1F0000 | (ra_val >> 16),
+                                    0x37FF0000 | (ra_val & 0xFFFF)))
+                    j_off = tramp_base + len(tramp)
+                    tramp.extend(pk(make_j(j_target), NOP))
+                    new_relocs.append(j_off)
                 else:
-                    # JR (non-linking): mult+mflo then jr.
-                    emit_mul_expansion(mul_insn)
-                    tramp.extend(pk(prev, NOP))
+                    # JR/JALR — copy the instruction
+                    tramp.extend(pk(make_mult(rs, rt), make_mflo(rd), prev, NOP))
 
-                # Patch: replace branch with J trampoline; NOP
-                kill(branch_off)
-                kill(i)
+                killed_offsets.add(branch_off)
+                killed_offsets.add(i)
                 wr32(code, branch_off, make_j(t_addr))
-                wr32(code, i, NOP)  # NOP the mul (was delay slot)
+                wr32(code, i, NOP)
                 new_relocs.append(branch_off)
 
                 i += 4
                 continue
 
-        # Collect consecutive muls
-        run = []
-        j = i
-        while j < data_size and j in mul_offsets and j not in patched:
-            run.append(j)
-            patched.add(j)
-            j += 4
+        # Normal case: J trampoline; NOP at patch site
+        # Trampoline: mult;mflo; then fetch next instruction.
+        # If next is also mul, expand it too. Repeat until non-mul.
 
-        # Build trampoline
-        t_off = emit_tramp()
+        t_off = tramp_base + len(tramp)
         t_addr = load_addr + t_off
 
-        for off in run:
-            emit_mul_expansion(rd32(code, off))
+        # Expand this mul and any consecutive muls
+        pos = i
+        while pos < data_size and is_mul(rd32(code, pos)):
+            mul_insn = rd32(code, pos)
+            rs, rt, rd = mul_parts(mul_insn)
+            tramp.extend(pk(make_mult(rs, rt), make_mflo(rd)))
+            patched.add(pos)
+            n_mul += 1
+            killed_offsets.add(pos)
+            pos += 4
 
-        if len(run) >= 2:
-            # ── Consecutive muls ──────────────────────────────────────────
-            # J delay slot clobbers run[1], which is a mul already in the
-            # trampoline. Return to first insn after the run.
-            ret = load_addr + run[-1] + 4
-            j_off = tramp_base + len(tramp)
-            tramp.extend(pk(make_j(ret), NOP))
-            new_relocs.append(j_off)
-            counts['consecutive'] += 1
+        # pos now points to the first non-mul instruction after the run.
+        # Fetch it into the trampoline (NOP it at patch site),
+        # UNLESS it's a branch target (other code jumps to it).
+        next_va = load_addr + pos
+        if pos < data_size and next_va not in branch_targets:
+            next_insn = rd32(code, pos)
 
-            kill(run[0]); kill(run[0] + 4)
-            wr32(code, run[0], make_j(t_addr))
-            wr32(code, run[0] + 4, NOP)
-            new_relocs.append(run[0])
-            for off in run[1:]:
-                kill(off)
-                wr32(code, off, NOP)
-
-        else:
-            # ── Single mul ────────────────────────────────────────────────
-            next_insn = rd32(code, run[0] + 4)
-
-            if not is_branch_or_jump(next_insn):
-                # Case 2a: next insn is NOT a branch/jump.
-                # NOP it and execute it in the trampoline after mflo,
-                # returning to mul+8.  This avoids the delay-slot
-                # double-execution bug where next_insn can clobber
-                # the mul's source registers before the trampoline
-                # reads them for mult.
-                #
-                # Exception: if mul+4 is a branch target, we can't NOP it
-                # (would break the back-edge).  In that case, leave it as
-                # the J delay slot — only safe when next_insn doesn't
-                # write to mul's rs or rt.
-                mul_va = load_addr + run[0]
-                next_va = mul_va + 4
-
-                if next_va in branch_targets:
-                    # mul+4 is a branch target — keep it intact (old approach)
-                    ret = next_va
-                    j_off = tramp_base + len(tramp)
-                    tramp.extend(pk(make_j(ret), NOP))
-                    new_relocs.append(j_off)
-                    kill(run[0])
-                    wr32(code, run[0], make_j(t_addr))
-                    new_relocs.append(run[0])
+            if is_branch_or_jump(next_insn):
+                # Next instruction is a branch/jump — also grab delay slot.
+                ds = rd32(code, pos + 4) if pos + 4 < data_size else NOP
+                op = (next_insn >> 26) & 0x3F
+                if op in (2, 3):  # J or JAL — needs reloc
+                    j_insn_off = tramp_base + len(tramp)
+                    tramp.extend(pk(next_insn, ds))
+                    new_relocs.append(j_insn_off)
                 else:
-                    # Safe to NOP: put next_insn in trampoline
-                    tramp.extend(pk(next_insn))
-                    ret = next_va + 4  # mul+8
+                    tramp.extend(pk(next_insn, ds))
+                # JAL/JALR: after the call returns, need J-back
+                if op == 3 or (op == 0 and (next_insn & 0x3F) == 9):
+                    ret_addr = load_addr + pos + 8
                     j_off = tramp_base + len(tramp)
-                    tramp.extend(pk(make_j(ret), NOP))
+                    tramp.extend(pk(make_j(ret_addr), NOP))
                     new_relocs.append(j_off)
-                    kill(run[0]); kill(run[0] + 4)
-                    wr32(code, run[0], make_j(t_addr))
-                    wr32(code, run[0] + 4, NOP)
-                    new_relocs.append(run[0])
-                counts['simple'] += 1
-
-            elif is_conditional_branch(next_insn):
-                # Case 2b-branch: conditional branch at mul+4.
-                # NOP it and its delay slot; handle in trampoline.
-                branch_va = load_addr + run[0] + 4
-                ds = rd32(code, run[0] + 8)
-                emit_branch_emulation(next_insn, branch_va, ds)
-                counts['branch'] += 1
-
-                kill(run[0]); kill(run[0] + 4); kill(run[0] + 8)
-                wr32(code, run[0], make_j(t_addr))
-                wr32(code, run[0] + 4, NOP)
-                wr32(code, run[0] + 8, NOP)
-                new_relocs.append(run[0])
-
-            elif is_link(next_insn):
-                # Case 2b-link: JAL/JALR at mul+4.
-                # Trampoline: mult; mflo; jal target; ds; j return; nop
-                ds = rd32(code, run[0] + 8)
-                emit_j_or_jal(next_insn)  # copy JAL with reloc
-                tramp.extend(pk(ds))
-                ret = load_addr + run[0] + 12
-                j_off = tramp_base + len(tramp)
-                tramp.extend(pk(make_j(ret), NOP))
-                new_relocs.append(j_off)
-                counts['link'] += 1
-
-                kill(run[0]); kill(run[0] + 4); kill(run[0] + 8)
-                wr32(code, run[0], make_j(t_addr))
-                wr32(code, run[0] + 4, NOP)
-                wr32(code, run[0] + 8, NOP)
-                new_relocs.append(run[0])
-
-            elif is_j_no_link(next_insn):
-                # Case 2b-j: unconditional J at mul+4. No return needed.
-                ds = rd32(code, run[0] + 8)
-                emit_j_or_jal(next_insn)  # copy J with reloc
-                tramp.extend(pk(ds))
-                counts['j'] += 1
-
-                kill(run[0]); kill(run[0] + 4); kill(run[0] + 8)
-                wr32(code, run[0], make_j(t_addr))
-                wr32(code, run[0] + 4, NOP)
-                wr32(code, run[0] + 8, NOP)
-                new_relocs.append(run[0])
-
+                killed_offsets.add(pos)
+                killed_offsets.add(pos + 4)
+                wr32(code, pos, NOP)
+                wr32(code, pos + 4, NOP)
+                pos += 4  # account for delay slot
             else:
-                # JR (non-linking) — no absolute addr, no reloc needed
-                ds = rd32(code, run[0] + 8)
-                tramp.extend(pk(next_insn, ds))
-                counts['jr'] += 1
+                tramp.extend(pk(next_insn))
+                killed_offsets.add(pos)
+                wr32(code, pos, NOP)
 
-                kill(run[0]); kill(run[0] + 4); kill(run[0] + 8)
-                wr32(code, run[0], make_j(t_addr))
-                wr32(code, run[0] + 4, NOP)
-                wr32(code, run[0] + 8, NOP)
-                new_relocs.append(run[0])
+                # J back to pos+4
+                ret_addr = load_addr + pos + 4
+                j_off = tramp_base + len(tramp)
+                tramp.extend(pk(make_j(ret_addr), NOP))
+                new_relocs.append(j_off)
+        else:
+            # Can't NOP: it's a branch target. J back to pos directly.
+            ret_addr = load_addr + pos
+            j_off = tramp_base + len(tramp)
+            tramp.extend(pk(make_j(ret_addr), NOP))
+            new_relocs.append(j_off)
 
-        n_mul_tramp += len(run)
-        i = run[-1] + 4
+        # Patch site: J trampoline; NOP
+        wr32(code, i, make_j(t_addr))
+        wr32(code, i + 4, NOP)
+        new_relocs.append(i)
+        killed_offsets.add(i)
+        if i + 4 != pos:
+            killed_offsets.add(i + 4)
 
-    print(f"madd={n_madd}  msub={n_msub}  mul={n_mul_tramp} (trampoline)  delay_slot={n_delay}")
-    print(f"  single: simple={counts['simple']}  branch={counts['branch']}  "
-          f"jal={counts['link']}  j={counts['j']}  jr={counts['jr']}  "
-          f"consecutive={counts['consecutive']}")
+        i = pos + 4
+
+    print(f"madd={n_madd}  msub={n_msub}  mul={n_mul} (trampoline, {n_delay} in delay slots)")
     print(f"trampolines: {len(tramp)} bytes")
 
-    # --- Verify ---
-    errors = 0
-    for off in mul_offsets:
-        if off < 4 or off not in patched: continue
-        insn = struct.unpack_from('<I', code, off)[0]
-        if not is_branch_or_jump(insn): continue
-        prev = struct.unpack_from('<I', code, off - 4)[0]
-        if is_branch_or_jump(prev):
-            print(f"  WARN: branch-in-delay-slot at 0x{load_addr + off:08x}")
-            errors += 1
-    for k in range(0, len(tramp) - 4, 4):
-        a = struct.unpack_from('<I', tramp, k)[0]
-        b = struct.unpack_from('<I', tramp, k + 4)[0]
-        if is_branch_or_jump(a) and is_branch_or_jump(b):
-            # Inverted-branch trampolines have branch → j by design
-            if is_conditional_branch(a) and (a & 0xFFFF) == 2:
-                continue
-            print(f"  WARN: jump+jump in trampoline at offset 0x{k:x}")
-            errors += 1
-    print(f"verify: {'OK' if not errors else f'{errors} issues!'}")
-
     # --- Build output ---
-    # Output raw code+data+BSS+trampolines as a standalone binary.
-    # The original .app file is left untouched (it has 55MB of resources after RAWD).
     bss_pad = mem_size - data_size
     rawd_bin = code + b'\x00' * bss_pad + tramp
     new_mem_size = mem_size + len(tramp)

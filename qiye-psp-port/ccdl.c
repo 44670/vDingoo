@@ -7,7 +7,7 @@
 #include <psputility.h>
 #include <pspkernel.h>
 #include <pspdebug.h>
-#define printf pspDebugScreenPrintf
+/* #define printf pspDebugScreenPrintf */
 #endif
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */

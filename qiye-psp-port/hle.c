@@ -20,7 +20,7 @@
 #include <pspctrl.h>
 #include <pspaudio.h>
 
-#define printf pspDebugScreenPrintf
+/* #define printf pspDebugScreenPrintf */
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Global state

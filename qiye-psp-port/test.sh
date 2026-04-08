@@ -80,4 +80,4 @@ LOGFILE="$SCRIPT_DIR/ppsspp.log"
 echo "=== Running in PPSSPP ==="
 echo "Log: $LOGFILE"
 killall PPSSPPSDL 2>/dev/null || true
-"$PPSSPP_BIN" "$EBOOT_PATH" -j --loglevel=1 >> "$LOGFILE" 2>&1
+"$PPSSPP_BIN" "$EBOOT_PATH" -j --loglevel=3 2>&1 | tee "$LOGFILE"
