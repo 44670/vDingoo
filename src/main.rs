@@ -253,6 +253,16 @@ fn run_until_sentinel(ctx: &mut EmuCtx, trace: bool, profile: bool, max_insns: u
                 ctx.cpu.insn_count += 76806;
                 continue;
             }
+            0x80a4a1dc => {
+                aot_qiye::scanline_textured_rgb_fog_f(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 500;
+                continue;
+            }
+            0x80a55b18 => {
+                aot_qiye::scanline_zrw_textured_pal_key_opaque(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 500;
+                continue;
+            }
             _ => {}
         }
 

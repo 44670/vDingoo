@@ -300,6 +300,78 @@ pub fn raster_copy_buffer_16to32(cpu: &mut Cpu, mem: &mut Memory) {
     cpu.next_pc = cpu.pc.wrapping_add(4);
 }
 
+/// AOT: scanline_texturedRGB_fogF (0x80a4a1dc, 232 bytes, 7 basic blocks)
+///
+/// Textured scanline rasterizer with fog. For each row, iterates columns
+/// sampling a paletted texture (u8→u16 via palette), ORs fog color, writes u32.
+///
+/// Original: int scanline_texturedRGB_fogF(ScanlineState* a0)
+pub fn scanline_textured_rgb_fog_f(cpu: &mut Cpu, mem: &mut Memory) {
+    let scan = cpu.gpr[4]; // $a0
+
+    let width = (mem.read_u32(scan.wrapping_add(0x44)) as i32)
+        .wrapping_sub(mem.read_u32(scan.wrapping_add(0x3c)) as i32); // x_end - x_start
+    let height = (mem.read_u32(scan.wrapping_add(0x48)) as i32)
+        .wrapping_sub(mem.read_u32(scan.wrapping_add(0x40)) as i32); // y_end - y_start
+
+    let initial_v = mem.read_u32(scan.wrapping_add(0x30)) as i32;
+    let mut t0 = initial_v << 16;
+
+    if height <= 0 {
+        cpu.set_gpr(2, 0);
+        cpu.pc = cpu.gpr[31];
+        cpu.next_pc = cpu.pc.wrapping_add(4);
+        return;
+    }
+
+    let u_step = mem.read_u32(scan.wrapping_add(0x4c)) as i32;
+    let v_step = mem.read_u32(scan.wrapping_add(0x50)) as i32;
+    let fog_color = mem.read_u32(scan.wrapping_add(0x58));
+    let stride = mem.read_u32(scan) as i32;
+    let tex_offset = mem.read_u32(scan.wrapping_add(0x2c)) as i32;
+
+    for _ in 0..height {
+        if width > 0 {
+            let src_row = mem.read_u32(scan.wrapping_add(0x28));
+            let dst_base = mem.read_u32(scan.wrapping_add(0x20));
+            let tex_info = mem.read_u32(scan.wrapping_add(0x10));
+            let palette = mem.read_u32(tex_info.wrapping_add(0x54));
+
+            let mut u_accum: i32 = 0;
+            for col in 0..width {
+                let tex_idx_addr = src_row.wrapping_add((u_accum >> 16) as u32);
+                let tex_idx = mem.read_u8(tex_idx_addr) as u32;
+                let color = mem.read_u16(palette.wrapping_add(tex_idx << 1)) as u32;
+                let pixel = color | fog_color;
+                let dst_addr = dst_base.wrapping_add((col as u32) << 2);
+                mem.write_u32(dst_addr, pixel);
+                u_accum = u_accum.wrapping_add(u_step);
+            }
+        }
+
+        // Advance to next row
+        let dst_ptr = mem.read_u32(scan.wrapping_add(0x20));
+        mem.write_u32(
+            scan.wrapping_add(0x20),
+            dst_ptr.wrapping_add((stride << 2) as u32),
+        );
+
+        t0 = t0.wrapping_add(v_step);
+
+        // Recompute source row pointer
+        let tex_info = mem.read_u32(scan.wrapping_add(0x10));
+        let tex_data = mem.read_u32(tex_info.wrapping_add(0x4c));
+        let pitch = mem.read_u32(tex_info.wrapping_add(0x28)) as i32;
+        let v = t0 >> 16;
+        let new_src = tex_data.wrapping_add(v.wrapping_mul(pitch).wrapping_add(tex_offset) as u32);
+        mem.write_u32(scan.wrapping_add(0x28), new_src);
+    }
+
+    cpu.set_gpr(2, 0);
+    cpu.pc = cpu.gpr[31];
+    cpu.next_pc = cpu.pc.wrapping_add(4);
+}
+
 /// AOT: Raster_presentFramebuffer (0x80a486e4, 136 bytes, 5 basic blocks)
 ///
 /// Copies the internal render buffer (u16 RGB565 pixels) to the LCD
@@ -348,4 +420,127 @@ pub fn raster_present_framebuffer(cpu: &mut Cpu, mem: &mut Memory) {
     // The interpreter will handle: HLE call → set dirty=1 → epilogue → return
     cpu.pc = 0x80a4874c;
     cpu.next_pc = 0x80a48750;
+}
+
+/// AOT: scanline_zrwTexturedPalKey_opaque (0x80a55b18, 304 bytes, 12 basic blocks)
+///
+/// Z-buffered textured scanline with palette color-key transparency.
+/// Iterates spans (0x18 bytes each, sentinel 0xFE7961), per-pixel:
+///   - Z-test against zbuffer (skip if behind)
+///   - Texture coord → byte index → palette lookup (u16)
+///   - Color key test (skip if texel == transparent index)
+///   - Write (z_masked | palette_color) to zbuffer
+///
+/// Original: void scanline_zrwTexturedPalKey_opaque(Renderer* a0, SpanList* a1)
+pub fn scanline_zrw_textured_pal_key_opaque(cpu: &mut Cpu, mem: &mut Memory) {
+    let renderer = cpu.gpr[4]; // $a0
+    let mut span_ptr = cpu.gpr[5]; // $a1
+
+    const SENTINEL: u32 = 0xFFFE_7961;
+
+    // Block 1: load texture data pointer (renderer->texture->data)
+    let tex_info = mem.read_u32(renderer.wrapping_add(0x1a6c));
+    let tex_data = mem.read_u32(tex_info.wrapping_add(0x4c));
+
+    // Check first span sentinel
+    let first = mem.read_u32(span_ptr);
+    if first == SENTINEL {
+        cpu.pc = cpu.gpr[31];
+        cpu.next_pc = cpu.pc.wrapping_add(4);
+        return;
+    }
+
+    // Texture addressing masks/shifts
+    let mask_1db8 = mem.read_u32(renderer.wrapping_add(0x1db8));
+    let shift_1dbc = mem.read_u32(renderer.wrapping_add(0x1dbc));
+    let mask_1db4 = mem.read_u32(renderer.wrapping_add(0x1db4));
+
+    // Color key (transparent index)
+    let color_key = mem.read_u8(renderer.wrapping_add(0x1e50));
+
+    // Per-pixel advance steps
+    let t2_step = mem.read_u32(renderer.wrapping_add(0x1ddc)) as i32;
+    let t1_step = mem.read_u32(renderer.wrapping_add(0x1de0)) as i32;
+    let t0_step = mem.read_u32(renderer.wrapping_add(0x1dd8)) as i32;
+
+    loop {
+        // Block 3: per-span setup — update renderer position tracking
+        let pos = mem.read_u32(renderer.wrapping_add(0x1dc0)) as i32;
+        let span_x = mem.read_u32(span_ptr) as i32;
+        let count = pos.wrapping_sub(span_x); // $t3
+
+        let dir_accum = mem.read_u32(renderer.wrapping_add(0x1dc4)) as i32;
+        let dir_delta = mem.read_u32(renderer.wrapping_add(0x1dc8)) as i32;
+        let new_dir = dir_accum.wrapping_add(dir_delta);
+        mem.write_u32(renderer.wrapping_add(0x1dc4), new_dir as u32);
+
+        if new_dir >= 0 {
+            // Block 5: positive direction
+            let dir_step = mem.read_u32(renderer.wrapping_add(0x1dd4)) as i32;
+            let new_pos = pos.wrapping_add(dir_step);
+            mem.write_u32(renderer.wrapping_add(0x1dc0), new_pos as u32);
+            let sub_val = mem.read_u32(renderer.wrapping_add(0x1dcc)) as i32;
+            mem.write_u32(
+                renderer.wrapping_add(0x1dc4),
+                new_dir.wrapping_sub(sub_val) as u32,
+            );
+        } else {
+            // Block 4: negative direction
+            let add_val = mem.read_u32(renderer.wrapping_add(0x1dd0)) as i32;
+            let new_pos = pos.wrapping_add(add_val);
+            mem.write_u32(renderer.wrapping_add(0x1dc0), new_pos as u32);
+        }
+
+        // Block 8: skip if count <= 0
+        if count > 0 {
+            // Block 7: load span fields
+            let mut zbuf_ptr = mem.read_u32(span_ptr.wrapping_add(4)); // $a3 = zbuf
+            let mut t2 = mem.read_u32(span_ptr.wrapping_add(0x0c)) as i32; // $t2
+            let mut t1 = mem.read_u32(span_ptr.wrapping_add(0x10)) as i32; // $t1
+            let mut t0 = mem.read_u32(span_ptr.wrapping_add(0x08)) as i32; // $t0
+
+            // Block 11: inner pixel loop
+            for _ in 0..count {
+                // Z-test: (t0 << 8) & 0xffff0000 vs zbuf[pixel]
+                let z_masked = ((t0 << 8) as u32) & 0xffff_0000;
+                let zbuf_val = mem.read_u32(zbuf_ptr);
+
+                if z_masked >= zbuf_val {
+                    // Block 10: texture coordinate computation
+                    let tex_v = ((t1 as u32) & mask_1db8) << (shift_1dbc & 31);
+                    let tex_u = (t2 as u32) & mask_1db4;
+                    let tex_offset = (tex_v.wrapping_add(tex_u)) >> 16;
+                    let texel_addr = tex_data.wrapping_add(tex_offset);
+                    let texel_idx = mem.read_u8(texel_addr);
+
+                    // Color key test
+                    if texel_idx != color_key {
+                        // Block 12: palette lookup and write
+                        let pal_ptr = mem.read_u32(
+                            mem.read_u32(renderer.wrapping_add(0x1a6c)).wrapping_add(0x54),
+                        );
+                        let pal_offset = ((texel_idx as u32) << 6) | 0x1e;
+                        let pal_color = mem.read_u16(pal_ptr.wrapping_add(pal_offset)) as u32;
+                        mem.write_u32(zbuf_ptr, z_masked | pal_color);
+                    }
+                }
+
+                // Block 9: advance
+                zbuf_ptr = zbuf_ptr.wrapping_add(4);
+                t2 = t2.wrapping_add(t2_step);
+                t1 = t1.wrapping_add(t1_step);
+                t0 = t0.wrapping_add(t0_step);
+            }
+        }
+
+        // Block 6: next span
+        span_ptr = span_ptr.wrapping_add(0x18);
+        let next = mem.read_u32(span_ptr);
+        if next == SENTINEL {
+            break;
+        }
+    }
+
+    cpu.pc = cpu.gpr[31];
+    cpu.next_pc = cpu.pc.wrapping_add(4);
 }
