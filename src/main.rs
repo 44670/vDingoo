@@ -293,6 +293,16 @@ fn run_until_sentinel(ctx: &mut EmuCtx, trace: bool, profile: bool, max_insns: u
                 ctx.cpu.insn_count += 500;
                 continue;
             }
+            0x80ad2ad0 => {
+                aot_qiye::softfloat_from_int(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 45;
+                continue;
+            }
+           0x80a931dc => {
+                aot_qiye::anim_texture_update(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 500;
+                continue;
+            }
             _ => {}
         }
 

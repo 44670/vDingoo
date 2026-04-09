@@ -861,3 +861,153 @@ pub fn scanline_zrw_textured_pal_fog_key_opaque(cpu: &mut Cpu, mem: &mut Memory)
     cpu.pc = cpu.gpr[31];
     cpu.next_pc = cpu.pc.wrapping_add(4);
 }
+
+
+
+/// AOT: softfloat_from_int (0x80ad2ad0, 180 bytes, 230 callers)
+///
+/// Converts int32 to IEEE 754 single-precision float. Replaced with native cast.
+pub fn softfloat_from_int(cpu: &mut Cpu, _mem: &mut Memory) {
+    let val = cpu.gpr[4] as i32;
+    cpu.set_gpr(2, (val as f32).to_bits());
+    cpu.pc = cpu.gpr[31];
+    cpu.next_pc = cpu.pc.wrapping_add(4);
+}
+
+/// AOT: AnimTexture_update (0x80a931dc, 412 bytes, 20 basic blocks)
+///
+/// Updates animated texture: advances frame, computes blend factor (0-31),
+/// then per-pixel RGB565 interpolation between source and target color.
+/// Inlines AnimTexture_stop + DepthBuffer_clearAll for the end-of-animation path.
+///
+/// Original: int AnimTexture_update(AnimTex* a0, u32* a1_src, u16* a2_dst)
+pub fn anim_texture_update(cpu: &mut Cpu, mem: &mut Memory) {
+    let this = cpu.gpr[4]; // $a0
+    let mut src = cpu.gpr[5]; // $a1 — u32* source pixels
+    let dst_base = cpu.gpr[6]; // $a2 — u16* destination pixels
+
+    // Check active flag
+    if mem.read_u32(this.wrapping_add(0x20)) == 0 {
+        cpu.set_gpr(2, 0);
+        cpu.pc = cpu.gpr[31];
+        cpu.next_pc = cpu.pc.wrapping_add(4);
+        return;
+    }
+
+    // Frame tracking
+    let current = mem.read_u32(this.wrapping_add(0x18));
+    let total = mem.read_u32(this.wrapping_add(0x1c));
+
+    if current != total {
+        // Increment frame
+        mem.write_u32(this.wrapping_add(0x18), current.wrapping_add(1));
+    } else {
+        // At end of animation
+        let looping = mem.read_u32(this.wrapping_add(0x30));
+        if looping == 0 {
+            // Not looping — inline AnimTexture_stop
+            mem.write_u32(this.wrapping_add(0x24), 1); // done = 1
+            mem.write_u32(this.wrapping_add(0x20), 0); // active = 0
+            if mem.read_u32(this.wrapping_add(0x28)) == 0 {
+                // Forward: swap depth buffers and clear
+                let renderer_ptr = mem.read_u32(this.wrapping_add(0x14));
+                let v1 = mem.read_u32(renderer_ptr.wrapping_add(0x1a374));
+                let flag = mem.read_u8(v1.wrapping_add(0x1e4f));
+                let db = if flag == 0 {
+                    mem.read_u32(v1.wrapping_add(0x1a80))
+                } else {
+                    mem.read_u32(v1.wrapping_add(0x1a84))
+                };
+                mem.write_u32(v1.wrapping_add(0x1a7c), db);
+                // DepthBuffer_clearAll: *(db + 0x10) = 0
+                mem.write_u32(db.wrapping_add(0x10), 0);
+            }
+        } else {
+            // Looping — set done flag but continue
+            mem.write_u32(this.wrapping_add(0x24), 1);
+        }
+    }
+
+    // Re-read current frame (may have changed)
+    let frame = mem.read_u32(this.wrapping_add(0x18)) as i32;
+
+    // Blend factor: (frame * 31) / total_frames (0-31 range)
+    let total_i = total as i32;
+    if total_i == 0 {
+        // Division by zero — original code hits break instruction
+        // Just return to avoid crash
+        cpu.pc = cpu.gpr[31];
+        cpu.next_pc = cpu.pc.wrapping_add(4);
+        return;
+    }
+    let blend = (frame.wrapping_mul(31)) / total_i;
+
+    // If forward direction (reverse==0): invert blend
+    let blend = if mem.read_u32(this.wrapping_add(0x28)) == 0 {
+        32 - blend
+    } else {
+        blend
+    };
+    let blend_u = (blend & 0xff) as u32;
+
+    // Pixel loop: width * height
+    let height = mem.read_u32(this.wrapping_add(8)) as i32;
+    let width = mem.read_u32(this.wrapping_add(4)) as i32;
+    let count = height.wrapping_mul(width);
+
+    if count <= 0 {
+        cpu.set_gpr(2, 0);
+        cpu.pc = cpu.gpr[31];
+        cpu.next_pc = cpu.pc.wrapping_add(4);
+        return;
+    }
+
+    let target_color = mem.read_u16(this.wrapping_add(0x2c)) as u32;
+    let mut dst = dst_base;
+
+    for _ in 0..count {
+        let pixel = mem.read_u32(src);
+        // Base copy: write low u16 to dest
+        mem.write_u16(dst, pixel as u16);
+        src = src.wrapping_add(4);
+
+        let high = pixel & 0xffff_0000;
+        if high != 0x6fff_0000 {
+            // Not a marker pixel — apply blending
+            if blend_u >= 2 {
+                if blend_u >= 31 {
+                    // Full target
+                    mem.write_u16(dst, target_color as u16);
+                } else {
+                    // RGB565 interpolation
+                    let tgt = target_color;
+                    let tgt_exp = ((tgt & 0xf800) << 10)
+                        | ((tgt & 0x7e0) << 5)
+                        | (tgt & 0x1f);
+
+                    let src_c = mem.read_u16(dst) as u32;
+                    let src_exp = ((src_c & 0xf800) << 10)
+                        | ((src_c & 0x7e0) << 5)
+                        | (src_c & 0x1f);
+
+                    let diff = tgt_exp.wrapping_sub(src_exp) as i32;
+                    let blended = (diff.wrapping_mul(blend_u as i32))
+                        .wrapping_add((src_exp << 5) as i32);
+                    let blended = blended as u32;
+
+                    let r = (blended & 0x7c00_0000) >> 15;
+                    let g = (blended & 0x001f_8000) >> 10;
+                    let b = (blended & 0x0000_03e0) >> 5;
+                    mem.write_u16(dst, (r | g | b) as u16);
+                }
+            }
+            // blend < 2: keep base copy as-is
+        }
+
+        dst = dst.wrapping_add(2);
+    }
+
+    cpu.set_gpr(2, 0);
+    cpu.pc = cpu.gpr[31];
+    cpu.next_pc = cpu.pc.wrapping_add(4);
+}
