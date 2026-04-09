@@ -263,6 +263,36 @@ fn run_until_sentinel(ctx: &mut EmuCtx, trace: bool, profile: bool, max_insns: u
                 ctx.cpu.insn_count += 500;
                 continue;
             }
+            0x80ad26e0 => {
+                aot_qiye::softfloat_mul(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 120;
+                continue;
+            }
+            0x80ad28d0 => {
+                aot_qiye::softfloat_div(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 90;
+                continue;
+            }
+            0x80ad7420 => {
+                aot_qiye::softfloat_pack(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 90;
+                continue;
+            }
+            0x80a08814 => {
+                aot_qiye::vec3_dot(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 98;
+                continue;
+            }
+            0x80a553c4 => {
+                aot_qiye::scanline_zrw_textured_pal_fog_opaque(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 500;
+                continue;
+            }
+            0x80a56228 => {
+                aot_qiye::scanline_zrw_textured_pal_fog_key_opaque(&mut ctx.cpu, ctx.mem);
+                ctx.cpu.insn_count += 500;
+                continue;
+            }
             _ => {}
         }
 

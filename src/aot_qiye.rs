@@ -464,34 +464,8 @@ pub fn scanline_zrw_textured_pal_key_opaque(cpu: &mut Cpu, mem: &mut Memory) {
     let t0_step = mem.read_u32(renderer.wrapping_add(0x1dd8)) as i32;
 
     loop {
-        // Block 3: per-span setup — update renderer position tracking
-        let pos = mem.read_u32(renderer.wrapping_add(0x1dc0)) as i32;
-        let span_x = mem.read_u32(span_ptr) as i32;
-        let count = pos.wrapping_sub(span_x); // $t3
+        let count = zrw_span_setup(renderer, span_ptr, mem);
 
-        let dir_accum = mem.read_u32(renderer.wrapping_add(0x1dc4)) as i32;
-        let dir_delta = mem.read_u32(renderer.wrapping_add(0x1dc8)) as i32;
-        let new_dir = dir_accum.wrapping_add(dir_delta);
-        mem.write_u32(renderer.wrapping_add(0x1dc4), new_dir as u32);
-
-        if new_dir >= 0 {
-            // Block 5: positive direction
-            let dir_step = mem.read_u32(renderer.wrapping_add(0x1dd4)) as i32;
-            let new_pos = pos.wrapping_add(dir_step);
-            mem.write_u32(renderer.wrapping_add(0x1dc0), new_pos as u32);
-            let sub_val = mem.read_u32(renderer.wrapping_add(0x1dcc)) as i32;
-            mem.write_u32(
-                renderer.wrapping_add(0x1dc4),
-                new_dir.wrapping_sub(sub_val) as u32,
-            );
-        } else {
-            // Block 4: negative direction
-            let add_val = mem.read_u32(renderer.wrapping_add(0x1dd0)) as i32;
-            let new_pos = pos.wrapping_add(add_val);
-            mem.write_u32(renderer.wrapping_add(0x1dc0), new_pos as u32);
-        }
-
-        // Block 8: skip if count <= 0
         if count > 0 {
             // Block 7: load span fields
             let mut zbuf_ptr = mem.read_u32(span_ptr.wrapping_add(4)); // $a3 = zbuf
@@ -537,6 +511,349 @@ pub fn scanline_zrw_textured_pal_key_opaque(cpu: &mut Cpu, mem: &mut Memory) {
         span_ptr = span_ptr.wrapping_add(0x18);
         let next = mem.read_u32(span_ptr);
         if next == SENTINEL {
+            break;
+        }
+    }
+
+    cpu.pc = cpu.gpr[31];
+    cpu.next_pc = cpu.pc.wrapping_add(4);
+}
+
+/// AOT: softfloat_mul (0x80ad26e0, 488 bytes, 383 callers)
+///
+/// Software IEEE 754 single-precision multiply. Replaced with native f32 mul.
+pub fn softfloat_mul(cpu: &mut Cpu, _mem: &mut Memory) {
+    let a = f32::from_bits(cpu.gpr[4]);
+    let b = f32::from_bits(cpu.gpr[5]);
+    cpu.set_gpr(2, (a * b).to_bits());
+    cpu.pc = cpu.gpr[31];
+    cpu.next_pc = cpu.pc.wrapping_add(4);
+}
+
+/// AOT: softfloat_div (0x80ad28d0, 356 bytes, 115 callers)
+///
+/// Software IEEE 754 single-precision divide. Replaced with native f32 div.
+pub fn softfloat_div(cpu: &mut Cpu, _mem: &mut Memory) {
+    let a = f32::from_bits(cpu.gpr[4]);
+    let b = f32::from_bits(cpu.gpr[5]);
+    cpu.set_gpr(2, (a / b).to_bits());
+    cpu.pc = cpu.gpr[31];
+    cpu.next_pc = cpu.pc.wrapping_add(4);
+}
+
+/// AOT: softfloat_pack (0x80ad7420, 360 bytes, 27 basic blocks)
+///
+/// Packs an unpacked float struct {class, sign, exponent, mantissa_with_guard}
+/// into IEEE 754 single-precision format with round-to-nearest-even.
+///
+/// Struct at $a0: [0]=class (0/1=normal, 2=zero, 4=inf/nan), [1]=sign, [2]=exp, [3]=mantissa
+pub fn softfloat_pack(cpu: &mut Cpu, mem: &mut Memory) {
+    let struct_ptr = cpu.gpr[4];
+    let arg3 = cpu.gpr[6]; // $a2 template
+    let class = mem.read_u32(struct_ptr);
+    let sign = mem.read_u32(struct_ptr.wrapping_add(4));
+    let mut mantissa = mem.read_u32(struct_ptr.wrapping_add(12));
+    let mut exp_out: u32 = 0;
+
+    if class < 2 {
+        // Normal number
+        mantissa |= 0x0010_0000;
+        let exp = mem.read_u32(struct_ptr.wrapping_add(8)) as i32;
+
+        if exp < -126 {
+            // Denormal
+            let shift = (-126 - exp) as u32;
+            if shift < 26 {
+                let sticky = if (mantissa & ((1u32 << shift) - 1)) != 0 { 1u32 } else { 0 };
+                mantissa = (mantissa >> shift) | sticky;
+            } else {
+                mantissa = 0;
+            }
+            // Round denormal
+            let guard = mantissa & 0x7f;
+            if guard == 0x40 {
+                if (mantissa & 0x80) != 0 {
+                    mantissa = mantissa.wrapping_add(0x40);
+                }
+            } else {
+                mantissa = mantissa.wrapping_add(0x3f);
+            }
+            if mantissa > 0x3fff_ffff {
+                exp_out = 1;
+            }
+            mantissa >>= 7;
+        } else if exp < 128 {
+            // Normal range
+            exp_out = (exp + 127) as u32;
+            let guard = mantissa & 0x7f;
+            if guard == 0x40 {
+                if (mantissa & 0x80) != 0 {
+                    mantissa = mantissa.wrapping_add(0x40);
+                }
+            } else {
+                mantissa = mantissa.wrapping_add(0x3f);
+            }
+            if (mantissa as i32) < 0 {
+                mantissa >>= 1;
+                exp_out = exp_out.wrapping_add(1);
+            }
+            mantissa >>= 7;
+        } else {
+            // Overflow → infinity
+            exp_out = 0xff;
+            mantissa = 0;
+        }
+    } else if class == 4 {
+        exp_out = 0xff;
+        mantissa = 0;
+    } else if class == 2 {
+        mantissa = 0;
+    } else if mantissa != 0 {
+        // Unknown class with nonzero mantissa: load exponent and process
+        let exp = mem.read_u32(struct_ptr.wrapping_add(8)) as i32;
+        if exp < -126 {
+            let shift = (-126 - exp) as u32;
+            if shift < 26 {
+                let sticky = if (mantissa & ((1u32 << shift) - 1)) != 0 { 1u32 } else { 0 };
+                mantissa = (mantissa >> shift) | sticky;
+            } else {
+                mantissa = 0;
+            }
+            let guard = mantissa & 0x7f;
+            if guard == 0x40 {
+                if (mantissa & 0x80) != 0 {
+                    mantissa = mantissa.wrapping_add(0x40);
+                }
+            } else {
+                mantissa = mantissa.wrapping_add(0x3f);
+            }
+            if mantissa > 0x3fff_ffff {
+                exp_out = 1;
+            }
+            mantissa >>= 7;
+        } else if exp < 128 {
+            exp_out = (exp + 127) as u32;
+            let guard = mantissa & 0x7f;
+            if guard == 0x40 {
+                if (mantissa & 0x80) != 0 {
+                    mantissa = mantissa.wrapping_add(0x40);
+                }
+            } else {
+                mantissa = mantissa.wrapping_add(0x3f);
+            }
+            if (mantissa as i32) < 0 {
+                mantissa >>= 1;
+                exp_out = exp_out.wrapping_add(1);
+            }
+            mantissa >>= 7;
+        } else {
+            exp_out = 0xff;
+            mantissa = 0;
+        }
+    }
+    // else: class unknown, mantissa == 0 → pack as zero with exp_out=0
+
+    // Pack: sign | exponent | mantissa
+    let mant_bits = mantissa & 0x007f_ffff;
+    let template_bits = arg3 & 0xff80_0000;
+    let combined = (template_bits | mant_bits) & 0x807f_ffff;
+    let with_exp = combined | ((exp_out & 0xff) << 23);
+    let result = (with_exp & 0x7fff_ffff) | (sign << 31);
+
+    cpu.set_gpr(2, result);
+    cpu.pc = cpu.gpr[31];
+    cpu.next_pc = cpu.pc.wrapping_add(4);
+}
+
+/// AOT: vec3_dot (0x80a08814, 392 bytes, 1 basic block, 90 callers)
+///
+/// 16.16 fixed-point dot product: *result = a.x*b.x + a.y*b.y + a.z*b.z
+/// Returns result pointer in $v0.
+pub fn vec3_dot(cpu: &mut Cpu, mem: &mut Memory) {
+    let result_ptr = cpu.gpr[4];
+    let a_ptr = cpu.gpr[5];
+    let b_ptr = cpu.gpr[6];
+
+    let ax = mem.read_u32(a_ptr) as i32;
+    let bx = mem.read_u32(b_ptr) as i32;
+    let ay = mem.read_u32(a_ptr.wrapping_add(4)) as i32;
+    let by = mem.read_u32(b_ptr.wrapping_add(4)) as i32;
+    let az = mem.read_u32(a_ptr.wrapping_add(8)) as i32;
+    let bz = mem.read_u32(b_ptr.wrapping_add(8)) as i32;
+
+    let dot = fpmul(ax, bx)
+        .wrapping_add(fpmul(ay, by))
+        .wrapping_add(fpmul(az, bz));
+
+    mem.write_u32(result_ptr, dot as u32);
+    cpu.set_gpr(2, result_ptr);
+    cpu.pc = cpu.gpr[31];
+    cpu.next_pc = cpu.pc.wrapping_add(4);
+}
+
+/// Shared span iteration + position tracking for z-buffered scanlines.
+#[inline(always)]
+fn zrw_span_setup(renderer: u32, span_ptr: u32, mem: &mut Memory) -> i32 {
+    let pos = mem.read_u32(renderer.wrapping_add(0x1dc0)) as i32;
+    let span_x = mem.read_u32(span_ptr) as i32;
+    let count = pos.wrapping_sub(span_x);
+
+    let dir_accum = mem.read_u32(renderer.wrapping_add(0x1dc4)) as i32;
+    let dir_delta = mem.read_u32(renderer.wrapping_add(0x1dc8)) as i32;
+    let new_dir = dir_accum.wrapping_add(dir_delta);
+    mem.write_u32(renderer.wrapping_add(0x1dc4), new_dir as u32);
+
+    if new_dir >= 0 {
+        let dir_step = mem.read_u32(renderer.wrapping_add(0x1dd4)) as i32;
+        mem.write_u32(renderer.wrapping_add(0x1dc0), pos.wrapping_add(dir_step) as u32);
+        let sub_val = mem.read_u32(renderer.wrapping_add(0x1dcc)) as i32;
+        mem.write_u32(renderer.wrapping_add(0x1dc4), new_dir.wrapping_sub(sub_val) as u32);
+    } else {
+        let add_val = mem.read_u32(renderer.wrapping_add(0x1dd0)) as i32;
+        mem.write_u32(renderer.wrapping_add(0x1dc0), pos.wrapping_add(add_val) as u32);
+    }
+
+    count
+}
+
+/// AOT: scanline_zrwTexturedPalFog_opaque (0x80a553c4, 316 bytes, 11 blocks)
+///
+/// Z-buffered textured scanline with fog-based palette lookup (no transparency).
+/// Palette index = (texel << 5 | (fog >> 8)) << 1
+pub fn scanline_zrw_textured_pal_fog_opaque(cpu: &mut Cpu, mem: &mut Memory) {
+    let renderer = cpu.gpr[4];
+    let mut span_ptr = cpu.gpr[5];
+    const SENTINEL: u32 = 0xFFFE_7961;
+
+    let tex_info = mem.read_u32(renderer.wrapping_add(0x1a6c));
+    let tex_data = mem.read_u32(tex_info.wrapping_add(0x4c));
+
+    if mem.read_u32(span_ptr) == SENTINEL {
+        cpu.pc = cpu.gpr[31];
+        cpu.next_pc = cpu.pc.wrapping_add(4);
+        return;
+    }
+
+    let mask_1db8 = mem.read_u32(renderer.wrapping_add(0x1db8));
+    let shift_1dbc = mem.read_u32(renderer.wrapping_add(0x1dbc));
+    let mask_1db4 = mem.read_u32(renderer.wrapping_add(0x1db4));
+    let t3_step = mem.read_u32(renderer.wrapping_add(0x1ddc)) as i32;
+    let t2_step = mem.read_u32(renderer.wrapping_add(0x1de0)) as i32;
+    let t1_step = mem.read_u32(renderer.wrapping_add(0x1de4)) as i32;
+    let t0_step = mem.read_u32(renderer.wrapping_add(0x1dd8)) as i32;
+
+    loop {
+        let count = zrw_span_setup(renderer, span_ptr, mem);
+
+        if count > 0 {
+            let mut zbuf_ptr = mem.read_u32(span_ptr.wrapping_add(4));
+            let mut t3 = mem.read_u32(span_ptr.wrapping_add(0x0c)) as i32;
+            let mut t2 = mem.read_u32(span_ptr.wrapping_add(0x10)) as i32;
+            let mut t1 = mem.read_u32(span_ptr.wrapping_add(0x14)) as i32;
+            let mut t0 = mem.read_u32(span_ptr.wrapping_add(0x08)) as i32;
+
+            for _ in 0..count {
+                let z_masked = ((t0 << 8) as u32) & 0xffff_0000;
+                let zbuf_val = mem.read_u32(zbuf_ptr);
+
+                if z_masked >= zbuf_val {
+                    let tex_v = ((t2 as u32) & mask_1db8) << (shift_1dbc & 31);
+                    let tex_u = (t3 as u32) & mask_1db4;
+                    let tex_offset = tex_v.wrapping_add(tex_u) >> 16;
+                    let texel = mem.read_u8(tex_data.wrapping_add(tex_offset)) as u32;
+
+                    let pal_idx = ((texel << 5) | ((t1 >> 8) as u32 & 0x1f)) << 1;
+                    let pal_ptr = mem.read_u32(
+                        mem.read_u32(renderer.wrapping_add(0x1a6c)).wrapping_add(0x54),
+                    );
+                    let color = mem.read_u16(pal_ptr.wrapping_add(pal_idx)) as u32;
+                    mem.write_u32(zbuf_ptr, z_masked | color);
+                }
+
+                zbuf_ptr = zbuf_ptr.wrapping_add(4);
+                t3 = t3.wrapping_add(t3_step);
+                t2 = t2.wrapping_add(t2_step);
+                t1 = t1.wrapping_add(t1_step);
+                t0 = t0.wrapping_add(t0_step);
+            }
+        }
+
+        span_ptr = span_ptr.wrapping_add(0x18);
+        if mem.read_u32(span_ptr) == SENTINEL {
+            break;
+        }
+    }
+
+    cpu.pc = cpu.gpr[31];
+    cpu.next_pc = cpu.pc.wrapping_add(4);
+}
+
+/// AOT: scanline_zrwTexturedPalFogKey_opaque (0x80a56228, 324 bytes, 12 blocks)
+///
+/// Z-buffered textured scanline with fog palette AND color-key transparency.
+pub fn scanline_zrw_textured_pal_fog_key_opaque(cpu: &mut Cpu, mem: &mut Memory) {
+    let renderer = cpu.gpr[4];
+    let mut span_ptr = cpu.gpr[5];
+    const SENTINEL: u32 = 0xFFFE_7961;
+
+    let tex_info = mem.read_u32(renderer.wrapping_add(0x1a6c));
+    let tex_data = mem.read_u32(tex_info.wrapping_add(0x4c));
+
+    if mem.read_u32(span_ptr) == SENTINEL {
+        cpu.pc = cpu.gpr[31];
+        cpu.next_pc = cpu.pc.wrapping_add(4);
+        return;
+    }
+
+    let mask_1db8 = mem.read_u32(renderer.wrapping_add(0x1db8));
+    let shift_1dbc = mem.read_u32(renderer.wrapping_add(0x1dbc));
+    let mask_1db4 = mem.read_u32(renderer.wrapping_add(0x1db4));
+    let color_key = mem.read_u8(renderer.wrapping_add(0x1e50));
+    let t3_step = mem.read_u32(renderer.wrapping_add(0x1ddc)) as i32;
+    let t2_step = mem.read_u32(renderer.wrapping_add(0x1de0)) as i32;
+    let t4_step = mem.read_u32(renderer.wrapping_add(0x1de4)) as i32;
+    let t0_step = mem.read_u32(renderer.wrapping_add(0x1dd8)) as i32;
+
+    loop {
+        let count = zrw_span_setup(renderer, span_ptr, mem);
+
+        if count > 0 {
+            let mut zbuf_ptr = mem.read_u32(span_ptr.wrapping_add(4));
+            let mut t3 = mem.read_u32(span_ptr.wrapping_add(0x0c)) as i32;
+            let mut t2 = mem.read_u32(span_ptr.wrapping_add(0x10)) as i32;
+            let mut t4 = mem.read_u32(span_ptr.wrapping_add(0x14)) as i32;
+            let mut t0 = mem.read_u32(span_ptr.wrapping_add(0x08)) as i32;
+
+            for _ in 0..count {
+                let z_masked = ((t0 << 8) as u32) & 0xffff_0000;
+                let zbuf_val = mem.read_u32(zbuf_ptr);
+
+                if z_masked >= zbuf_val {
+                    let tex_v = ((t2 as u32) & mask_1db8) << (shift_1dbc & 31);
+                    let tex_u = (t3 as u32) & mask_1db4;
+                    let tex_offset = tex_v.wrapping_add(tex_u) >> 16;
+                    let texel = mem.read_u8(tex_data.wrapping_add(tex_offset));
+
+                    if texel != color_key {
+                        let pal_idx = (((texel as u32) << 5) | ((t4 >> 8) as u32 & 0x1f)) << 1;
+                        let pal_ptr = mem.read_u32(
+                            mem.read_u32(renderer.wrapping_add(0x1a6c)).wrapping_add(0x54),
+                        );
+                        let color = mem.read_u16(pal_ptr.wrapping_add(pal_idx)) as u32;
+                        mem.write_u32(zbuf_ptr, z_masked | color);
+                    }
+                }
+
+                zbuf_ptr = zbuf_ptr.wrapping_add(4);
+                t3 = t3.wrapping_add(t3_step);
+                t2 = t2.wrapping_add(t2_step);
+                t4 = t4.wrapping_add(t4_step);
+                t0 = t0.wrapping_add(t0_step);
+            }
+        }
+
+        span_ptr = span_ptr.wrapping_add(0x18);
+        if mem.read_u32(span_ptr) == SENTINEL {
             break;
         }
     }
