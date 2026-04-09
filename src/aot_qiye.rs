@@ -905,7 +905,10 @@ pub fn anim_texture_update(cpu: &mut Cpu, mem: &mut Memory) {
         // At end of animation
         let looping = mem.read_u32(this.wrapping_add(0x30));
         if looping == 0 {
-            // Not looping — inline AnimTexture_stop
+            // Not looping — just set done flag, animation continues to last frame
+            mem.write_u32(this.wrapping_add(0x24), 1);
+        } else {
+            // Looping — inline AnimTexture_stop (end and deactivate)
             mem.write_u32(this.wrapping_add(0x24), 1); // done = 1
             mem.write_u32(this.wrapping_add(0x20), 0); // active = 0
             if mem.read_u32(this.wrapping_add(0x28)) == 0 {
@@ -922,9 +925,6 @@ pub fn anim_texture_update(cpu: &mut Cpu, mem: &mut Memory) {
                 // DepthBuffer_clearAll: *(db + 0x10) = 0
                 mem.write_u32(db.wrapping_add(0x10), 0);
             }
-        } else {
-            // Looping — set done flag but continue
-            mem.write_u32(this.wrapping_add(0x24), 1);
         }
     }
 
